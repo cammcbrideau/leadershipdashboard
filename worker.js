@@ -419,7 +419,10 @@ function esc(s) {
     .replace(/"/g, '&quot;');
 }
 
-function j(v) { return JSON.stringify(v); }
+// Safe JSON for inline <script> — prevents </script> from closing the tag early
+function j(v) {
+  return JSON.stringify(v).replace(/<\//g, '<\\/');
+}
 
 function renderPage(d) {
   const { kpis: k } = d;
@@ -630,6 +633,19 @@ function renderPage(d) {
 </head>
 <body class="hide-completed">
 
+<!-- Loading bar: fills while Asana data fetches server-side, fades out when JS is done -->
+<div id="loadingBar" style="position:fixed;top:0;left:0;height:3px;width:0;background:linear-gradient(90deg,#4299e1,#9f7aea,#e879f9);z-index:99999;transition:width 2.4s cubic-bezier(.1,.6,.4,1),opacity 0.4s"></div>
+<script>
+  (function(){
+    var bar = document.getElementById('loadingBar');
+    bar.style.width = '85%';
+    window.addEventListener('load', function(){
+      bar.style.width = '100%';
+      setTimeout(function(){ bar.style.opacity='0'; setTimeout(function(){ bar.remove(); },400); }, 300);
+    });
+  })();
+</script>
+
 <!-- Theme + header -->
 <div class="header">
   <div>
@@ -641,6 +657,7 @@ function renderPage(d) {
     <button class="theme-toggle" onclick="toggleTheme()" id="themeBtn">☀️ Light Mode</button>
     <span class="badge">LIVE</span>
     <span class="last-updated">Updated ${esc(updatedDate)}</span>
+    <button class="theme-toggle" onclick="location.reload(true)" title="Force-refresh data from Asana" style="font-size:12px;padding:4px 10px">↻ Refresh</button>
   </div>
 </div>
 
