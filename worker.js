@@ -65,22 +65,32 @@ async function handleApiData(request, env, ctx) {
 
 // ─── Asana fetch ──────────────────────────────────────────────────────────────
 
-async function fetchAllTasks(token) {
-  const OPT_FIELDS = [
-    'gid','name','assignee.name',
-    'completed','completed_at','created_at','modified_at','due_on',
-    'memberships.section.name',
-    'custom_fields.name','custom_fields.display_value',
-    'num_likes',
-  ].join(',');
+// Fields fetched for open tasks — custom_fields and num_likes excluded (on hold)
+// to keep page count and payload small (~12 pages vs 23).
+const OPEN_FIELDS = [
+  'gid','name','assignee.name',
+  'completed','created_at','modified_at','due_on',
+  'memberships.section.name',
+].join(',');
 
-  const tasks = [];
-  let offset  = null;
+// Lighter field set for recently-completed snapshot (1 page only)
+const COMPLETED_FIELDS = [
+  'gid','name','assignee.name',
+  'completed','completed_at','created_at',
+  'memberships.section.name',
+].join(',');
 
+async function fetchOpenTasks(token) {
+  const tasks  = [];
+  let   offset = null;
   do {
-    const params = new URLSearchParams({ project: PROJECT_GID, opt_fields: OPT_FIELDS, limit: '100' });
+    const params = new URLSearchParams({
+      project:    PROJECT_GID,
+      opt_fields: OPEN_FIELDS,
+      completed:  'false',          // ← only open tasks (~half the pages)
+      limit:      '100',
+    });
     if (offset) params.set('offset', offset);
-
     const resp = await fetch(`${ASANA_API}/tasks?${params}`, {
       headers: { Authorization: `Bearer ${token}` },
     });
@@ -88,63 +98,95 @@ async function fetchAllTasks(token) {
       const body = await resp.text().catch(() => '');
       throw new Error(`Asana ${resp.status}: ${body.slice(0, 200)}`);
     }
-    const json  = await resp.json();
+    const json = await resp.json();
     tasks.push(...json.data);
     offset = json.next_page?.offset ?? null;
   } while (offset);
-
   return tasks;
+}
+
+async function fetchRecentCompleted(token) {
+  // Fetch 1 page (100 tasks) of recently completed — enough for the widget
+  const params = new URLSearchParams({
+    project:    PROJECT_GID,
+    opt_fields: COMPLETED_FIELDS,
+    completed:  'true',
+    sort_by:    'completed_at',
+    sort_ascending: 'false',
+    limit:      '100',
+  });
+  const resp = await fetch(`${ASANA_API}/tasks?${params}`, {
+    headers: { Authorization: `Bearer ${token}` },
+  });
+  if (!resp.ok) return [];
+  const json = await resp.json();
+  return json.data;
 }
 
 // ─── Data processing ──────────────────────────────────────────────────────────
 
 async function fetchAndProcess(token) {
-  const raw = await fetchAllTasks(token);
-  return processData(raw);
+  // Run both fetches concurrently
+  const [openRaw, completedRaw] = await Promise.all([
+    fetchOpenTasks(token),
+    fetchRecentCompleted(token),
+  ]);
+  return processData(openRaw, completedRaw);
 }
 
-function processData(raw) {
+// ON HOLD (add back when re-enabling Priority/Risk/Trend charts):
+// custom_fields (priority, consequence, reversibility), num_likes, completed history
+
+function processData(openRaw, completedRaw) {
   const today = new Date(); today.setUTCHours(0,0,0,0);
   const in14  = new Date(today); in14.setUTCDate(in14.getUTCDate() + 14);
 
-  const tasks = raw.map(t => {
+  const mapTask = (t, forceCompleted = false) => {
     const section  = t.memberships?.[0]?.section?.name ?? 'Unknown';
     const assignee = t.assignee?.name ?? 'Unassigned';
     const due      = t.due_on ?? '';
     const dueDate  = due ? new Date(due + 'T00:00:00Z') : null;
-    const overdue  = !t.completed && !!dueDate && dueDate < today;
-    const dueSoon  = !t.completed && !overdue && !!dueDate && dueDate <= in14;
-
-    let priority = null, consequence = null, reversibility = null;
-    for (const cf of t.custom_fields ?? []) {
-      if (!cf.display_value) continue;
-      if      (cf.name === 'Priority')      priority      = cf.display_value;
-      else if (cf.name === 'Consequence')   consequence   = cf.display_value;
-      else if (cf.name === 'Reversibility') reversibility = cf.display_value;
-    }
-
+    const completed = forceCompleted || t.completed;
+    const overdue  = !completed && !!dueDate && dueDate < today;
+    const dueSoon  = !completed && !overdue && !!dueDate && dueDate <= in14;
     return {
       gid: t.gid, name: t.name, assignee, section, due,
-      created:     (t.created_at  ?? '').slice(0,10),
+      created:     (t.created_at   ?? '').slice(0,10),
       completedAt: (t.completed_at ?? '').slice(0,10),
       modified:    (t.modified_at  ?? '').slice(0,10),
-      completed: t.completed, overdue, dueSoon,
-      priority, consequence, reversibility,
-      numLikes: t.num_likes ?? 0,
+      completed, overdue, dueSoon,
+      // custom_fields on hold — priority/consequence/reversibility not fetched
+      priority: null, consequence: null, reversibility: null,
     };
-  });
+  };
 
-  const open      = tasks.filter(t => !t.completed);
-  const done      = tasks.filter(t =>  t.completed);
-  const overdue   = open.filter(t => t.overdue);
-  const dueSoon   = open.filter(t => t.dueSoon);
-  const members   = new Set(tasks.filter(t => t.assignee !== 'Unassigned').map(t => t.assignee)).size;
+  // These sections are meeting/review columns — excluded from all dashboard views
+  const EXCLUDED_SECTIONS = new Set([
+    'High Impact (Week 1,3)',
+    'Post Incident Review (Week 2,4)',
+  ]);
 
+  const tasks      = openRaw.map(t => mapTask(t, false)).filter(t => !EXCLUDED_SECTIONS.has(t.section));
+  const recentDone = completedRaw.map(t => mapTask(t, true)).filter(t => !EXCLUDED_SECTIONS.has(t.section));
+
+  // Open tasks only (main dataset)
+  const open    = tasks; // all items in openRaw are completed=false
+  const overdue = open.filter(t => t.overdue);
+  const dueSoon = open.filter(t => t.dueSoon);
+  const members = new Set(
+    [...tasks, ...recentDone].filter(t => t.assignee !== 'Unassigned').map(t => t.assignee)
+  ).size;
+
+  // KPIs — open count is exact; completed is approximate (we only fetched 100 recent)
   const kpis = {
-    total: tasks.length, completed: done.length, open: open.length,
-    overdue: overdue.length, dueSoon: dueSoon.length, members,
-    completionRate: tasks.length ? ((done.length/tasks.length)*100).toFixed(1) : '0',
-    openRate:       tasks.length ? ((open.length/tasks.length)*100).toFixed(1) : '0',
+    total:          tasks.length,   // open task count (completed count not fetched)
+    completed:      recentDone.length,
+    open:           tasks.length,
+    overdue:        overdue.length,
+    dueSoon:        dueSoon.length,
+    members,
+    completionRate: '—',            // not available without full history
+    openRate:       '100',          // all fetched tasks are open
   };
 
   const recentlyAdded = tasks
@@ -160,19 +202,9 @@ function processData(raw) {
     if (t.assignee === 'Unassigned') continue;
     if (!aMap[t.assignee]) aMap[t.assignee] = {name:t.assignee,total:0,done:0,overdue:0};
     aMap[t.assignee].total++;
-    if (t.completed) aMap[t.assignee].done++;
-    if (t.overdue)   aMap[t.assignee].overdue++;
+    if (t.overdue) aMap[t.assignee].overdue++;
   }
-  const assignees = Object.values(aMap).sort((a,b) => (b.total-b.done)-(a.total-a.done));
-
-  const mCr = {}, mCo = {};
-  for (const t of tasks) {
-    if (t.created)     { const m=t.created.slice(0,7);     mCr[m]=(mCr[m]??0)+1; }
-    if (t.completedAt) { const m=t.completedAt.slice(0,7); mCo[m]=(mCo[m]??0)+1; }
-  }
-  const months      = [...new Set([...Object.keys(mCr),...Object.keys(mCo)])].sort().slice(-24);
-  const created_m   = months.map(m => mCr[m]??0);
-  const completed_m = months.map(m => mCo[m]??0);
+  const assignees = Object.values(aMap).sort((a,b) => b.total - a.total);
 
   const dowCreated = [0,0,0,0,0,0,0];
   for (const t of tasks) {
@@ -183,25 +215,10 @@ function processData(raw) {
   for (const t of tasks) {
     if (!sMap[t.section]) sMap[t.section]={total:0,done:0};
     sMap[t.section].total++;
-    if (t.completed) sMap[t.section].done++;
   }
   const topSections = Object.entries(sMap)
     .sort((a,b)=>b[1].total-a[1].total).slice(0,8)
     .map(([name,s])=>({name,total:s.total}));
-
-  const pc = {
-    high:          open.filter(t=>t.priority==='High').length,
-    medium:        open.filter(t=>t.priority==='Medium').length,
-    low:           open.filter(t=>t.priority==='Low').length,
-    highConseq:    open.filter(t=>t.consequence?.includes('High')).length,
-    lowConseq:     open.filter(t=>t.consequence?.includes('Low')).length,
-    reversible:    open.filter(t=>t.reversibility==='Reversible').length,
-    notReversible: open.filter(t=>t.reversibility==='Not reversible').length,
-  };
-
-  const likesData = tasks.filter(t=>t.numLikes>0)
-    .sort((a,b)=>b.numLikes-a.numLikes).slice(0,13)
-    .map(({name,section,numLikes:likes,gid})=>({name,section,likes,gid}));
 
   const wordCloud = buildWordCloud(open);
 
@@ -214,7 +231,7 @@ function processData(raw) {
       assignee:t.assignee,section:t.section}))
     .sort((a,b)=>b.age-a.age);
 
-  const recentCompleted = done
+  const recentCompleted = recentDone
     .filter(t=>t.completedAt&&t.assignee!=='Unassigned')
     .sort((a,b)=>b.completedAt.localeCompare(a.completedAt)).slice(0,20)
     .map(({gid,name,assignee,completedAt,section})=>({gid,name,assignee,completedAt,section}));
@@ -223,10 +240,10 @@ function processData(raw) {
 
   return {
     kpis, recentlyAdded, recentlyCommented, assignees,
-    kpiData: tasks, months, created: created_m, completed: completed_m,
-    dowCreated, topSections, priorityCounts: pc,
-    likesData, wordCloud, oldestTasks, recentCompleted, sectionHtml,
+    kpiData: tasks, dowCreated, topSections,
+    wordCloud, oldestTasks, recentCompleted, sectionHtml,
     generatedAt: new Date().toISOString(),
+    // ON HOLD: months/created/completed (trend chart), priorityCounts, likesData
   };
 }
 
@@ -452,14 +469,13 @@ const HTML_SHELL = `<!DOCTYPE html>
   <!-- Charts row 1 -->
   <div class="charts-row row-4" style="margin-bottom:20px">
     <div class="card"><h2><span class="dot" style="background:#4299e1"></span>Task Status</h2><div style="position:relative;height:180px"><canvas id="donutChart"></canvas></div><div style="display:flex;justify-content:center;gap:16px;margin-top:12px;flex-wrap:wrap"><span style="font-size:11px;color:#48bb78">● Completed</span><span style="font-size:11px;color:#4299e1">● Open</span><span style="font-size:11px;color:#fc8181">● Overdue</span></div></div>
-    <div class="card"><h2><span class="dot" style="background:#ecc94b"></span>Priority &amp; Risk</h2><div style="position:relative;height:200px"><canvas id="priorityChart"></canvas></div></div>
-    <div class="card"><h2><span class="dot" style="background:#48bb78"></span>Reversibility</h2><div style="position:relative;height:200px"><canvas id="riskChart"></canvas></div></div>
+    <!-- Priority & Risk + Reversibility charts on hold (custom_fields not fetched) -->
     <div class="card"><h2><span class="dot" style="background:#9f7aea"></span>Top Assignees</h2><div style="position:relative;height:200px"><canvas id="assigneeChart"></canvas></div></div>
   </div>
 
   <!-- Trend -->
   <div class="charts-row row-1" style="margin-bottom:20px">
-    <div class="card"><h2><span class="dot" style="background:#63b3ed"></span>Task Trend (Monthly)</h2><div style="position:relative;height:200px"><canvas id="trendChart"></canvas></div></div>
+    <!-- Task Trend (Monthly) on hold — requires full completed-task history -->
   </div>
 
   <!-- Section + Overdue -->
@@ -506,7 +522,7 @@ const HTML_SHELL = `<!DOCTYPE html>
 
   <!-- Most active + liked + DOW -->
   <div class="charts-row row-2" style="margin-bottom:20px">
-    <div class="card"><h2><span class="dot" style="background:#e879f9"></span>Most Liked Tasks</h2><table class="overdue-table"><thead><tr><th>Task</th><th>Section</th><th style="text-align:center">Likes</th></tr></thead><tbody id="likesTableBody"></tbody></table></div>
+    <!-- Most Liked Tasks on hold (num_likes not fetched) -->
     <div class="card"><h2><span class="dot" style="background:#f6ad55"></span>Task Volume: Day of Week (Created)</h2><div style="position:relative;height:200px"><canvas id="dowHeatChart"></canvas></div></div>
   </div>
 
@@ -554,7 +570,7 @@ setBar(5);
 // Each Asana page takes ~1s; ~23 pages total → ~23s cold, instant when cached.
 function init() {
   const msg       = document.getElementById('loadingMsg');
-  const EST_PAGES = 23;   // ~2300 tasks / 100 per page
+  const EST_PAGES = 12;   // ~1100 open tasks / 100 per page
   const PAGE_MS   = 1000; // observed ~1 s per page
   let   fakePage  = 0;
   let   ticker;
@@ -622,7 +638,7 @@ function populate(data) {
   renderOldestTable();
   renderRecentCompleted(data.recentCompleted);
   document.getElementById('assigneeBreakdownGrid').innerHTML = data.sectionHtml;
-  renderLikes(data.likesData);
+  // renderLikes on hold
   renderWordCloud(data.wordCloud);
   renderAssigneeList();
 }
@@ -758,59 +774,34 @@ function renderWordCloud(wordCloudData) {
 const chartPointer = (e, els) => { e.native.target.style.cursor = els.length ? 'pointer' : 'default'; };
 
 function initCharts(data) {
-  const k  = data.kpis;
-  const pc = data.priorityCounts;
+  const k = data.kpis;
 
-  // Donut
+  // Donut — open vs overdue (no completed count in this mode)
   new Chart(document.getElementById('donutChart'), {
     type: 'doughnut',
-    data: { labels:['Completed','Open','Overdue'], datasets:[{data:[k.completed,k.open,k.overdue],backgroundColor:['#48bb78','#4299e1','#fc8181'],borderColor:'transparent',borderWidth:0,spacing:4,hoverOffset:18,borderRadius:4}] },
+    data: { labels:['Open','Overdue'], datasets:[{data:[k.open - k.overdue, k.overdue],backgroundColor:['#4299e1','#fc8181'],borderColor:'transparent',borderWidth:0,spacing:4,hoverOffset:18,borderRadius:4}] },
     options: { cutout:'74%', plugins:{ legend:{display:false}, tooltip:{callbacks:{label:ctx=>{const tot=ctx.dataset.data.reduce((a,b)=>a+b,0);return ' '+ctx.label+': '+ctx.raw+' ('+((ctx.raw/tot)*100).toFixed(1)+'%)'}},backgroundColor:'rgba(15,17,23,.9)',titleColor:'#e2e8f0',bodyColor:'#a0aec0',borderColor:'#2d3748',borderWidth:1,padding:10,cornerRadius:8}},
       animation:{animateRotate:true,animateScale:true,duration:700,easing:'easeOutQuart'},
       responsive:true, maintainAspectRatio:false,
-      onClick:(e,els,chart)=>{ if(!els.length)return; const lb=chart.data.labels[els[0].index]; const m={Completed:t=>t.completed,Open:t=>!t.completed,Overdue:t=>t.overdue}; openModalWith(lb+' Tasks',kpiData.filter(m[lb]||(()=>true))); },
+      onClick:(e,els,chart)=>{ if(!els.length)return; const lb=chart.data.labels[els[0].index]; const m={Open:t=>!t.overdue,Overdue:t=>t.overdue}; openModalWith(lb+' Tasks',kpiData.filter(m[lb]||(()=>true))); },
       onHover:chartPointer }
   });
 
-  // Priority
-  new Chart(document.getElementById('priorityChart'), {
-    type:'bar',
-    data:{ labels:['High Priority','Medium Priority','Low Priority','High Consequence','Low Consequence'], datasets:[{label:'Tasks',data:[pc.high,pc.medium,pc.low,pc.highConseq,pc.lowConseq],backgroundColor:['#fc8181','#ecc94b','#68d391','#f6ad55','#4299e1'],borderRadius:6,borderSkipped:false}] },
-    options:{ indexAxis:'y', plugins:{legend:{display:false}}, scales:{x:{grid:{color:'#2d3748'},ticks:{color:'#718096'}},y:{grid:{display:false},ticks:{color:'#a0aec0'}}},
-      onClick:(e,els,chart)=>{if(!els.length)return;const lb=chart.data.labels[els[0].index];const m={'High Priority':t=>!t.completed&&t.priority==='High','Medium Priority':t=>!t.completed&&t.priority==='Medium','Low Priority':t=>!t.completed&&t.priority==='Low','High Consequence':t=>!t.completed&&t.consequence?.includes('High'),'Low Consequence':t=>!t.completed&&t.consequence?.includes('Low')};openModalWith(lb,kpiData.filter(m[lb]||(()=>false)));},
-      onHover:chartPointer, responsive:true, maintainAspectRatio:false }
-  });
-
-  // Risk
-  new Chart(document.getElementById('riskChart'), {
-    type:'bar',
-    data:{ labels:['Reversible','Not Reversible'], datasets:[{label:'Reversibility',data:[pc.reversible,pc.notReversible],backgroundColor:['#48bb78','#fc8181'],borderRadius:6,borderSkipped:false}] },
-    options:{ indexAxis:'y', plugins:{legend:{display:false}}, scales:{x:{grid:{color:'#2d3748'},ticks:{color:'#718096'}},y:{grid:{display:false},ticks:{color:'#a0aec0'}}}, responsive:true, maintainAspectRatio:false }
-  });
-
-  // Top assignees mini
+  // Top assignees mini (open tasks only)
   const topA = data.assignees.slice(0,12);
   new Chart(document.getElementById('assigneeChart'), {
     type:'bar',
-    data:{ labels:topA.map(a=>a.name.split(' ')[0]), datasets:[{label:'Done',data:topA.map(a=>a.done),backgroundColor:'#48bb78',borderRadius:4,stack:'s'},{label:'Open',data:topA.map(a=>a.total-a.done-a.overdue),backgroundColor:'#4299e1',borderRadius:4,stack:'s'},{label:'Overdue',data:topA.map(a=>a.overdue),backgroundColor:'#fc8181',borderRadius:4,stack:'s'}] },
+    data:{ labels:topA.map(a=>a.name.split(' ')[0]), datasets:[{label:'Open',data:topA.map(a=>a.total-a.overdue),backgroundColor:'#4299e1',borderRadius:4,stack:'s'},{label:'Overdue',data:topA.map(a=>a.overdue),backgroundColor:'#fc8181',borderRadius:4,stack:'s'}] },
     options:{ plugins:{legend:{display:false}}, scales:{x:{grid:{display:false},ticks:{color:'#718096',maxRotation:45}},y:{grid:{color:'#2d3748'},ticks:{color:'#718096'}}}, responsive:true, maintainAspectRatio:false }
   });
 
-  // Trend
-  new Chart(document.getElementById('trendChart'), {
-    type:'line',
-    data:{ labels:data.months, datasets:[{label:'Created',data:data.created,borderColor:'#4299e1',backgroundColor:'rgba(66,153,225,.08)',fill:true,tension:.4,pointRadius:3,pointBackgroundColor:'#4299e1'},{label:'Completed',data:data.completed,borderColor:'#48bb78',backgroundColor:'rgba(72,187,120,.08)',fill:true,tension:.4,pointRadius:3,pointBackgroundColor:'#48bb78'}] },
-    options:{ plugins:{legend:{position:'top',labels:{color:'#a0aec0',usePointStyle:true,pointStyleWidth:8}}}, scales:{x:{grid:{color:'#1e2538'},ticks:{color:'#4a5568',maxRotation:45}},y:{grid:{color:'#2d3748'},ticks:{color:'#718096'},beginAtZero:true}}, responsive:true, maintainAspectRatio:false }
-  });
-
-  // Sections
+  // Sections (open only)
   const secLabels = data.topSections.map(s=>s.name.replace('Post Incident Review (Week 2,4)','PIR').replace('High Impact (Week 1,3)','High Impact').replace('Action 5 days','A5d').replace('Action 10 days','A10d').replace('Action 30+ days','A30d+').replace('Action 90+ days','A90d+').replace('Propose to close','Propose Close').replace('Standing Items','Standing'));
-  const secDone   = data.topSections.map(s=>kpiData.filter(t=>t.section===s.name&&t.completed).length);
-  const secOpen   = data.topSections.map(s=>kpiData.filter(t=>t.section===s.name&&!t.completed).length);
+  const secOpen = data.topSections.map(s=>kpiData.filter(t=>t.section===s.name).length);
   new Chart(document.getElementById('sectionChart'), {
     type:'bar',
-    data:{ labels:secLabels, datasets:[{label:'Done',data:secDone,backgroundColor:'#48bb78',borderRadius:4,stack:'s'},{label:'Open',data:secOpen,backgroundColor:'#4299e1',borderRadius:4,stack:'s'}] },
-    options:{ plugins:{legend:{position:'top',labels:{color:'#a0aec0',usePointStyle:true}}}, scales:{x:{grid:{display:false},ticks:{color:'#a0aec0'}},y:{grid:{color:'#2d3748'},ticks:{color:'#718096'},beginAtZero:true}}, responsive:true, maintainAspectRatio:false }
+    data:{ labels:secLabels, datasets:[{label:'Open',data:secOpen,backgroundColor:'#4299e1',borderRadius:4}] },
+    options:{ plugins:{legend:{display:false}}, scales:{x:{grid:{display:false},ticks:{color:'#a0aec0'}},y:{grid:{color:'#2d3748'},ticks:{color:'#718096'},beginAtZero:true}}, responsive:true, maintainAspectRatio:false }
   });
 
   // DOW
@@ -824,7 +815,7 @@ function initCharts(data) {
   const fullA = data.assignees.slice(0,20);
   new Chart(document.getElementById('assigneeChartFull'), {
     type:'bar',
-    data:{ labels:fullA.map(a=>a.name.includes('@')?a.name.split('.')[0]:a.name.split(' ')[0]), datasets:[{label:'Done',data:fullA.map(a=>a.done),backgroundColor:'#48bb78',borderRadius:3,stack:'s'},{label:'Open',data:fullA.map(a=>a.total-a.done-a.overdue),backgroundColor:'#4299e1',borderRadius:3,stack:'s'},{label:'Overdue',data:fullA.map(a=>a.overdue),backgroundColor:'#fc8181',borderRadius:3,stack:'s'}] },
+    data:{ labels:fullA.map(a=>a.name.includes('@')?a.name.split('.')[0]:a.name.split(' ')[0]), datasets:[{label:'Open',data:fullA.map(a=>a.total-a.overdue),backgroundColor:'#4299e1',borderRadius:3,stack:'s'},{label:'Overdue',data:fullA.map(a=>a.overdue),backgroundColor:'#fc8181',borderRadius:3,stack:'s'}] },
     options:{ plugins:{legend:{position:'top',labels:{color:'#a0aec0',usePointStyle:true}}}, scales:{x:{grid:{display:false},ticks:{color:'#718096',maxRotation:60}},y:{grid:{color:'#2d3748'},ticks:{color:'#718096'},beginAtZero:true}}, responsive:true, maintainAspectRatio:false }
   });
 }
