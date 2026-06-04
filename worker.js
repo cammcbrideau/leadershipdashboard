@@ -16,7 +16,6 @@ export default {
   async fetch(request, env, ctx) {
     const url = new URL(request.url);
     if (url.pathname === '/api/data')   return handleApiData(request, env, ctx);
-    if (url.pathname === '/api/stream') return handleApiStream(request, env);
     return handleDashboard(request, env);
   },
 };
@@ -62,100 +61,6 @@ async function handleApiData(request, env, ctx) {
   } catch (err) {
     return jsonErr(String(err), 502);
   }
-}
-
-// ─── GET /api/stream  (SSE progress stream) ───────────────────────────────────
-
-function handleApiStream(request, env) {
-  if (!env.ASANA_TOKEN) {
-    return new Response('data: ' + JSON.stringify({error:'ASANA_TOKEN not set'}) + '\n\n',
-      { status: 500, headers: { 'Content-Type': 'text/event-stream' } });
-  }
-
-  const { readable, writable } = new TransformStream();
-  const writer  = writable.getWriter();
-  const enc     = new TextEncoder();
-  const send    = (obj) => writer.write(enc.encode('data: ' + JSON.stringify(obj) + '\n\n'));
-
-  // Run async work that keeps the stream open
-  (async () => {
-    try {
-      // Serve from cache immediately if available
-      const cache    = caches.default;
-      const cacheKey = new Request(new URL('/api-data-v1', request.url).toString());
-      const cached   = await cache.match(cacheKey);
-      if (cached) {
-        const data = await cached.json();
-        await send({ progress: 100, message: 'Loaded from cache', done: true, data, cached: true });
-        await writer.close();
-        return;
-      }
-
-      await send({ progress: 3, message: 'Connecting to Asana…' });
-
-      // Paginate with per-page progress
-      const OPT_FIELDS = [
-        'gid','name','assignee.name',
-        'completed','completed_at','created_at','modified_at','due_on',
-        'memberships.section.name',
-        'custom_fields.name','custom_fields.display_value',
-        'num_likes',
-      ].join(',');
-
-      const tasks  = [];
-      let offset   = null;
-      let page     = 0;
-      // We don't know the total page count upfront — estimate based on ~2300 tasks / 100 per page
-      const EST_PAGES = 24;
-
-      do {
-        page++;
-        const params = new URLSearchParams({ project: PROJECT_GID, opt_fields: OPT_FIELDS, limit: '100' });
-        if (offset) params.set('offset', offset);
-
-        const resp = await fetch(`${ASANA_API}/tasks?${params}`, {
-          headers: { Authorization: `Bearer ${env.ASANA_TOKEN}` },
-        });
-        if (!resp.ok) {
-          const body = await resp.text().catch(() => '');
-          throw new Error(`Asana ${resp.status}: ${body.slice(0, 200)}`);
-        }
-        const json = await resp.json();
-        tasks.push(...json.data);
-        offset = json.next_page?.offset ?? null;
-
-        // Progress: 5 → 75 % across pages
-        const pct = Math.min(5 + Math.round((page / EST_PAGES) * 70), 75);
-        await send({
-          progress: pct,
-          message:  `Fetching from Asana… page ${page} (${tasks.length} tasks loaded)`,
-        });
-      } while (offset);
-
-      await send({ progress: 80, message: `Processing ${tasks.length} tasks…` });
-      const data = processData(tasks);
-
-      // Store in cache
-      const cacheResp = new Response(JSON.stringify(data), {
-        headers: { 'Content-Type': 'application/json;charset=UTF-8', 'Cache-Control': `public, max-age=${CACHE_TTL}` },
-      });
-      await cache.put(cacheKey, cacheResp);
-
-      await send({ progress: 100, message: 'Done!', done: true, data });
-      await writer.close();
-    } catch (err) {
-      await send({ error: String(err) }).catch(() => {});
-      await writer.close().catch(() => {});
-    }
-  })();
-
-  return new Response(readable, {
-    headers: {
-      'Content-Type':     'text/event-stream',
-      'Cache-Control':    'no-cache',
-      'X-Accel-Buffering':'no',   // disable nginx buffering if proxied
-    },
-  });
 }
 
 // ─── Asana fetch ──────────────────────────────────────────────────────────────
@@ -521,7 +426,7 @@ const HTML_SHELL = `<!DOCTYPE html>
     <div class="kpi pink" style="cursor:default"><div class="val skeleton" style="height:36px;width:80px;margin:0 auto 6px"></div><div class="label">Members</div><div class="sub-val skeleton" style="height:12px;width:60px;margin:0 auto"></div></div>
   </div>
 
-  <div id="loadingMsg" style="font-size:15px">⏳ Connecting to Asana…</div>
+  <div id="loadingMsg" style="font-size:15px">⏳ Fetching from Asana… page 1 of ~23  (100 tasks)</div>
   <div id="dashContent" style="display:none">
 
   <!-- Recently Added + Active -->
@@ -644,44 +549,46 @@ function setBar(pct) {
 }
 setBar(5);
 
-// ── Bootstrap — uses SSE stream so progress is shown page-by-page ─────────────
+// ── Bootstrap ─────────────────────────────────────────────────────────────────
+// Fetches /api/data (cached 5 min at edge) and drives a calibrated progress bar.
+// Each Asana page takes ~1s; ~23 pages total → ~23s cold, instant when cached.
 function init() {
-  const msg = document.getElementById('loadingMsg');
-  let source;
+  const msg       = document.getElementById('loadingMsg');
+  const EST_PAGES = 23;   // ~2300 tasks / 100 per page
+  const PAGE_MS   = 1000; // observed ~1 s per page
+  let   fakePage  = 0;
+  let   ticker;
 
-  function cleanup() { try { source.close(); } catch(_) {} }
-
-  function onError(text) {
-    cleanup();
-    msg.innerHTML =
-      '<span style="color:#fc8181">⚠ ' + text + '</span><br><br>' +
-      '<button class="theme-toggle" onclick="init()">↻ Retry</button>';
-    setBar(0);
-  }
-
-  try {
-    source = new EventSource('/api/stream');
-
-    source.onmessage = (e) => {
-      let ev;
-      try { ev = JSON.parse(e.data); } catch(_) { return; }
-
-      if (ev.error) { onError('Failed to load data: ' + ev.error); return; }
-
-      // Update progress bar and message
-      if (ev.progress) setBar(ev.progress);
-      if (ev.message)  msg.innerHTML = (ev.cached ? '⚡' : '⏳') + ' ' + ev.message;
-
-      if (ev.done && ev.data) {
-        cleanup();
-        populate(ev.data);
+  function startTicker() {
+    ticker = setInterval(() => {
+      fakePage = Math.min(fakePage + 1, EST_PAGES - 1);
+      const pct = Math.round(5 + (fakePage / EST_PAGES) * 80);
+      setBar(pct);
+      if (fakePage < EST_PAGES - 1) {
+        msg.textContent = '⏳ Fetching from Asana… page ' + (fakePage + 1) +
+          ' of ~' + EST_PAGES + '  (' + ((fakePage + 1) * 100) + ' tasks)';
+      } else {
+        msg.textContent = '⏳ Processing tasks…';
       }
-    };
-
-    source.onerror = () => onError('Connection error — please refresh');
-  } catch (err) {
-    onError(String(err));
+    }, PAGE_MS);
   }
+
+  startTicker();
+
+  fetch('/api/data')
+    .then(r => { if (!r.ok) throw new Error('HTTP ' + r.status + ' from /api/data'); return r.json(); })
+    .then(data => {
+      clearInterval(ticker);
+      setBar(100);
+      populate(data);
+    })
+    .catch(err => {
+      clearInterval(ticker);
+      setBar(0);
+      msg.innerHTML =
+        '<span style="color:#fc8181">⚠ Failed to load data: ' + err.message + '</span><br><br>' +
+        '<button class="theme-toggle" onclick="init()">↻ Retry</button>';
+    });
 }
 
 // ── Populate everything ───────────────────────────────────────────────────────
