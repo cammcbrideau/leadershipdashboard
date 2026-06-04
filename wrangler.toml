@@ -2,13 +2,4 @@ name = "leadership-dashboard"
 main = "worker.js"
 compatibility_date = "2024-01-01"
 
-# Store the HTML template as a text binding
-# wrangler secret put ASANA_TOKEN  (run this once to set your Asana API token)
-
-[assets]
-# No static assets — everything served from worker.js
-
-# Optional: use Workers KV for longer caching across requests
-# [[kv_namespaces]]
-# binding = "CACHE"
-# id = "your-kv-namespace-id"
+# Secret: run `npx wrangler secret put ASANA_TOKEN` once to set your Asana API token

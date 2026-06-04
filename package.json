@@ -8,6 +8,6 @@
     "secret": "wrangler secret put ASANA_TOKEN"
   },
   "devDependencies": {
-    "wrangler": "^3"
+    "wrangler": "^4"
   }
 }
