@@ -32,7 +32,7 @@ function handleDashboard(_request, env) {
   return new Response(HTML_SHELL, {
     headers: {
       'Content-Type': 'text/html;charset=UTF-8',
-      'Cache-Control': 'public, max-age=3600',
+      'Cache-Control': 'no-store',   // always serve fresh HTML so JS updates deploy immediately
     },
   });
 }
@@ -443,7 +443,7 @@ const HTML_SHELL = `<!DOCTYPE html>
     <div class="kpi pink" style="cursor:default"><div class="val skeleton" style="height:36px;width:80px;margin:0 auto 6px"></div><div class="label">Members</div><div class="sub-val skeleton" style="height:12px;width:60px;margin:0 auto"></div></div>
   </div>
 
-  <div id="loadingMsg" style="font-size:15px">⏳ Fetching from Asana… page 1 of ~23  (100 tasks)</div>
+  <div id="loadingMsg" style="font-size:15px">⏳ Fetching from Asana… page 1 of ~12  (100 tasks)</div>
   <div id="dashContent" style="display:none">
 
   <!-- Recently Added + Active -->
@@ -571,22 +571,22 @@ setBar(5);
 function init() {
   const msg       = document.getElementById('loadingMsg');
   const EST_PAGES = 12;   // ~1100 open tasks / 100 per page
-  const PAGE_MS   = 1000; // observed ~1 s per page
-  let   fakePage  = 0;
+  let   elapsed   = 0;    // seconds since fetch started
   let   ticker;
 
   function startTicker() {
     ticker = setInterval(() => {
-      fakePage = Math.min(fakePage + 1, EST_PAGES - 1);
-      const pct = Math.round(5 + (fakePage / EST_PAGES) * 80);
+      elapsed++;
+      // Progress asymptotes toward 94% — never freezes, just slows down
+      const pct = Math.round(94 - 89 * Math.exp(-elapsed / 18));
       setBar(pct);
-      if (fakePage < EST_PAGES - 1) {
-        msg.textContent = '⏳ Fetching from Asana… page ' + (fakePage + 1) +
-          ' of ~' + EST_PAGES + '  (' + ((fakePage + 1) * 100) + ' tasks)';
+      if (elapsed <= EST_PAGES) {
+        msg.textContent = '⏳ Fetching from Asana… page ' + elapsed +
+          ' of ~' + EST_PAGES + '  (' + (elapsed * 100) + ' tasks)';
       } else {
-        msg.textContent = '⏳ Processing tasks…';
+        msg.textContent = '⏳ Almost there… processing ' + (elapsed * 100) + '+ tasks';
       }
-    }, PAGE_MS);
+    }, 1000);
   }
 
   startTicker();
