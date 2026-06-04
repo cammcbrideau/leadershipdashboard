@@ -1,0 +1,13 @@
+{
+  "name": "leadership-dashboard",
+  "version": "1.0.0",
+  "private": true,
+  "scripts": {
+    "dev":    "wrangler dev",
+    "deploy": "wrangler deploy",
+    "secret": "wrangler secret put ASANA_TOKEN"
+  },
+  "devDependencies": {
+    "wrangler": "^3"
+  }
+}
