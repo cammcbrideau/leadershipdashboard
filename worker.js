@@ -21,10 +21,98 @@ let memCacheFetching = false; // prevent stampede on concurrent cold requests
 export default {
   async fetch(request, env, ctx) {
     const url = new URL(request.url);
-    if (url.pathname === '/api/data')   return handleApiData(request, env, ctx);
+
+    // ── Auth gate (skip if DASHBOARD_PASSWORD secret not set) ────────────────
+    if (env.DASHBOARD_PASSWORD) {
+      // Handle login form POST
+      if (request.method === 'POST' && url.pathname === '/login') {
+        return handleLogin(request, env);
+      }
+      // All other routes require a valid auth cookie
+      if (!isAuthed(request, env)) {
+        return showLoginPage(url.pathname);
+      }
+    }
+
+    if (url.pathname === '/api/data') return handleApiData(request, env, ctx);
     return handleDashboard(request, env);
   },
 };
+
+// ─── Auth ─────────────────────────────────────────────────────────────────────
+
+const AUTH_COOKIE = 'dts-dash-auth';
+
+function isAuthed(request, env) {
+  const cookie = request.headers.get('Cookie') || '';
+  const match  = cookie.match(/dts-dash-auth=([^;]+)/);
+  return match?.[1] === env.DASHBOARD_PASSWORD;
+}
+
+async function handleLogin(request, env) {
+  const body     = await request.formData().catch(() => null);
+  const password = body?.get('password') ?? '';
+
+  if (password !== env.DASHBOARD_PASSWORD) {
+    return showLoginPage('/', true); // wrong password
+  }
+
+  // Correct — set cookie and redirect to dashboard
+  return new Response(null, {
+    status: 302,
+    headers: {
+      'Location': '/',
+      'Set-Cookie': `${AUTH_COOKIE}=${env.DASHBOARD_PASSWORD}; Path=/; HttpOnly; SameSite=Strict; Max-Age=43200`,
+    },
+  });
+}
+
+function showLoginPage(next = '/', failed = false) {
+  const html = `<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>DTS Leadership Dashboard — Sign in</title>
+<style>
+  *{box-sizing:border-box;margin:0;padding:0}
+  body{font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',Roboto,sans-serif;
+       background:#0f1117;color:#e2e8f0;min-height:100vh;
+       display:flex;align-items:center;justify-content:center}
+  .card{background:#1a1f35;border:1px solid #2d3748;border-radius:16px;
+        padding:40px 48px;width:100%;max-width:380px;text-align:center}
+  h1{font-size:20px;font-weight:700;margin-bottom:6px}
+  .sub{font-size:13px;color:#718096;margin-bottom:28px}
+  input[type=password]{width:100%;background:#0f1117;border:1px solid #2d3748;
+        border-radius:8px;color:#e2e8f0;padding:10px 14px;font-size:14px;
+        outline:none;margin-bottom:14px}
+  input[type=password]:focus{border-color:#4299e1}
+  button{width:100%;background:#4299e1;color:#fff;border:none;border-radius:8px;
+         padding:11px;font-size:14px;font-weight:600;cursor:pointer}
+  button:hover{background:#3182ce}
+  .error{color:#fc8181;font-size:13px;margin-bottom:12px}
+  .badge{display:inline-block;background:#e879f9;color:#fff;
+         font-size:11px;font-weight:600;padding:3px 10px;border-radius:12px;margin-bottom:16px}
+</style>
+</head>
+<body>
+<div class="card">
+  <div class="badge">LIVE</div>
+  <h1>DTS Leadership Dashboard</h1>
+  <div class="sub">Western Health Digital &amp; Technology Services</div>
+  ${failed ? '<div class="error">Incorrect password — try again</div>' : ''}
+  <form method="POST" action="/login">
+    <input type="password" name="password" placeholder="Enter password" autofocus autocomplete="current-password">
+    <button type="submit">Sign in</button>
+  </form>
+</div>
+</body>
+</html>`;
+  return new Response(html, {
+    status: failed ? 401 : 200,
+    headers: { 'Content-Type': 'text/html;charset=UTF-8', 'Cache-Control': 'no-store' },
+  });
+}
 
 // ─── GET / ────────────────────────────────────────────────────────────────────
 
@@ -38,7 +126,7 @@ function handleDashboard(_request, env) {
   return new Response(HTML_SHELL, {
     headers: {
       'Content-Type': 'text/html;charset=UTF-8',
-      'Cache-Control': 'no-store',   // always serve fresh HTML so JS updates deploy immediately
+      'Cache-Control': 'no-store',
     },
   });
 }
@@ -472,7 +560,7 @@ const HTML_SHELL = `<!DOCTYPE html>
 
 <div class="header">
   <div>
-    <h1>DTS Leadership Dashboard <span style="font-size:11px;font-weight:400;color:#4a5568;margin-left:8px">v16 · loading…</span></h1>
+    <h1>DTS Leadership Dashboard <span style="font-size:11px;font-weight:400;color:#4a5568;margin-left:8px">v17 · loading…</span></h1>
     <div class="sub">Western Health Digital &amp; Technology Services</div>
   </div>
   <div style="display:flex;align-items:center;gap:10px;flex-wrap:wrap">
@@ -480,7 +568,7 @@ const HTML_SHELL = `<!DOCTYPE html>
     <button class="theme-toggle" onclick="toggleTheme()" id="themeBtn">☀️ Light Mode</button>
     <span class="badge">LIVE</span>
     <span class="last-updated" id="lastUpdated">Loading…</span>
-    <button class="theme-toggle" onclick="try{localStorage.removeItem('dts-dash-v16')}catch(e){}location.reload()" style="font-size:12px;padding:4px 10px" title="Force-refresh from Asana (clears cache)">↻ Refresh</button>
+    <button class="theme-toggle" onclick="try{localStorage.removeItem('dts-dash-v17')}catch(e){}location.reload()" style="font-size:12px;padding:4px 10px" title="Force-refresh from Asana (clears cache)">↻ Refresh</button>
   </div>
 </div>
 
@@ -643,7 +731,7 @@ setBar(5);
 // Fetches /api/data (cached 5 min at edge) and drives a calibrated progress bar.
 // Each Asana page takes ~1s; ~23 pages total → ~23s cold, instant when cached.
 // localStorage cache key — bump version when data structure changes
-const LS_KEY     = 'dts-dash-v16';
+const LS_KEY     = 'dts-dash-v17';
 const LS_TTL_MS  = 5 * 60 * 1000; // 5 min
 
 function lsGet() {
@@ -689,7 +777,7 @@ function init() {
     setBar(100);
     try { populate(cached.data); } catch(e) { /* fall through to fresh fetch */ }
     const label = isFresh ? '⚡ cached' : '⚡ stale — refreshing';
-    document.querySelector('h1 span').textContent = 'v16 · ' + label;
+    document.querySelector('h1 span').textContent = 'v17 · ' + label;
 
     if (isFresh) return; // done — cache is fresh, no need to refetch
 
@@ -699,7 +787,7 @@ function init() {
       .then(data => {
         if (!data) return;
         lsPut(data);
-        document.querySelector('h1 span').textContent = 'v16 · refreshed';
+        document.querySelector('h1 span').textContent = 'v17 · refreshed';
       })
       .catch(() => {});
     return;
@@ -721,7 +809,7 @@ function init() {
       if (loadDiv) loadDiv.innerHTML = '<div class="load-title"><span class="spinner"></span>Rendering…</div>';
       try {
         populate(data);
-        document.querySelector('h1 span').textContent = 'v16 · loaded in ' + secs + 's';
+        document.querySelector('h1 span').textContent = 'v17 · loaded in ' + secs + 's';
       } catch(renderErr) {
         const ld = document.getElementById('loadingMsg');
         if (ld) ld.innerHTML = '<div class="load-title" style="color:#fc8181">⚠ Render error</div>'
