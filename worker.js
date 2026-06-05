@@ -407,7 +407,15 @@ const HTML_SHELL = `<!DOCTYPE html>
   /* Loading skeleton */
   .skeleton{border-radius:6px;background:linear-gradient(90deg,var(--border) 25%,var(--bg-card) 50%,var(--border) 75%);background-size:200% 100%;animation:shimmer 1.4s infinite}
   @keyframes shimmer{0%{background-position:200% 0}100%{background-position:-200% 0}}
-  #loadingMsg{text-align:center;padding:60px 20px;color:var(--text-faint);font-size:14px}
+  #loadingMsg{text-align:center;padding:40px 20px}
+  #loadingMsg .load-title{font-size:18px;font-weight:600;color:var(--text);margin-bottom:8px}
+  #loadingMsg .load-sub{font-size:13px;color:var(--text-faint);margin-bottom:20px}
+  #loadingMsg .load-bar-wrap{width:320px;height:6px;background:var(--border);border-radius:99px;margin:0 auto 12px;overflow:hidden}
+  #loadingMsg .load-bar-fill{height:100%;background:linear-gradient(90deg,#4299e1,#9f7aea);border-radius:99px;transition:width .8s ease;width:3%}
+  #loadingMsg .load-secs{font-size:28px;font-weight:800;color:#4299e1;line-height:1}
+  #loadingMsg .load-secs-label{font-size:11px;color:var(--text-faintest);margin-top:4px}
+  @keyframes spin{to{transform:rotate(360deg)}}
+  .spinner{display:inline-block;width:16px;height:16px;border:2px solid var(--border);border-top-color:#4299e1;border-radius:50%;animation:spin .8s linear infinite;vertical-align:middle;margin-right:6px}
   @media(max-width:900px){.kpi-grid{grid-template-columns:repeat(3,1fr)}.row-4,.row-3{grid-template-columns:1fr 1fr}.row-2{grid-template-columns:1fr}.header{padding:16px;flex-wrap:wrap;gap:10px}.container{padding:16px}}
   @media(max-width:600px){.kpi-grid{grid-template-columns:repeat(2,1fr)}.row-4,.row-3,.row-2{grid-template-columns:1fr}}
 </style>
@@ -443,7 +451,13 @@ const HTML_SHELL = `<!DOCTYPE html>
     <div class="kpi pink" style="cursor:default"><div class="val skeleton" style="height:36px;width:80px;margin:0 auto 6px"></div><div class="label">Members</div><div class="sub-val skeleton" style="height:12px;width:60px;margin:0 auto"></div></div>
   </div>
 
-  <div id="loadingMsg" style="font-size:15px">⏳ Fetching from Asana… page 1 of ~12  (100 tasks)</div>
+  <div id="loadingMsg">
+    <div class="load-title"><span class="spinner"></span>Loading live data from Asana</div>
+    <div class="load-sub">Fetching open tasks — takes ~15s on first load, instant when cached</div>
+    <div class="load-bar-wrap"><div class="load-bar-fill" id="loadBarFill"></div></div>
+    <div class="load-secs" id="loadSecs">0</div>
+    <div class="load-secs-label">seconds</div>
+  </div>
   <div id="dashContent" style="display:none">
 
   <!-- Recently Added + Active -->
@@ -569,22 +583,26 @@ setBar(5);
 // Fetches /api/data (cached 5 min at edge) and drives a calibrated progress bar.
 // Each Asana page takes ~1s; ~23 pages total → ~23s cold, instant when cached.
 function init() {
-  const msg       = document.getElementById('loadingMsg');
-  const EST_PAGES = 12;   // ~1100 open tasks / 100 per page
-  let   elapsed   = 0;    // seconds since fetch started
+  const secsEl = document.getElementById('loadSecs');
+  const fillEl = document.getElementById('loadBarFill');
+  let   secs   = 0;
   let   ticker;
 
   function startTicker() {
     ticker = setInterval(() => {
-      elapsed++;
-      // Progress asymptotes toward 94% — never freezes, just slows down
-      const pct = Math.round(94 - 89 * Math.exp(-elapsed / 18));
+      secs++;
+      // Update big second counter
+      if (secsEl) secsEl.textContent = secs;
+      // Progress bar asymptotes to 94%
+      const pct = Math.round(94 - 89 * Math.exp(-secs / 18));
       setBar(pct);
-      if (elapsed <= EST_PAGES) {
-        msg.textContent = '⏳ Fetching from Asana… page ' + elapsed +
-          ' of ~' + EST_PAGES + '  (' + (elapsed * 100) + ' tasks)';
-      } else {
-        msg.textContent = '⏳ Almost there… processing ' + (elapsed * 100) + '+ tasks';
+      if (fillEl) fillEl.style.width = pct + '%';
+      // After 35s show a warning
+      if (secs === 35) {
+        const msg = document.getElementById('loadingMsg');
+        if (msg) msg.insertAdjacentHTML('beforeend',
+          '<p style="margin-top:16px;color:#fc8181;font-size:13px">Taking longer than expected — '
+          + '<button class="theme-toggle" onclick="location.reload()" style="font-size:12px;padding:3px 10px">↻ Refresh</button></p>');
       }
     }, 1000);
   }
@@ -601,23 +619,27 @@ function init() {
     .then(data => {
       clearInterval(ticker);
       setBar(100);
-      msg.textContent = '⚙️ Rendering dashboard…';
+      const loadDiv = document.getElementById('loadingMsg');
+      if (loadDiv) loadDiv.innerHTML = '<div class="load-title"><span class="spinner"></span>Rendering…</div>';
       try {
         populate(data);
       } catch(renderErr) {
-        msg.innerHTML = '<span style="color:#fc8181;font-size:13px">⚠ Render error: '
-          + renderErr.message + '<br><code style="font-size:11px;opacity:.7">'
-          + (renderErr.stack||'').split('\n').slice(0,3).join('<br>')
-          + '</code></span><br><br>'
+        const ld = document.getElementById('loadingMsg');
+        if (ld) ld.innerHTML = '<div class="load-title" style="color:#fc8181">⚠ Render error</div>'
+          + '<div class="load-sub">' + renderErr.message + '</div>'
+          + '<pre style="font-size:10px;color:var(--text-faint);text-align:left;overflow:auto;max-width:600px;margin:12px auto">'
+          + (renderErr.stack||'').slice(0,400) + '</pre>'
           + '<button class="theme-toggle" onclick="init()">↻ Retry</button>';
       }
     })
     .catch(err => {
       clearInterval(ticker);
       setBar(0);
-      msg.innerHTML =
-        '<span style="color:#fc8181">⚠ Failed to fetch data: ' + err.message + '</span><br><br>' +
-        '<button class="theme-toggle" onclick="init()">↻ Retry</button>';
+      const loadDiv = document.getElementById('loadingMsg');
+      if (loadDiv) loadDiv.innerHTML =
+        '<div class="load-title" style="color:#fc8181">⚠ Failed to load data</div>'
+        + '<div class="load-sub">' + err.message + '</div>'
+        + '<br><button class="theme-toggle" onclick="init()">↻ Retry</button>';
     });
 }
 
