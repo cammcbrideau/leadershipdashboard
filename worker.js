@@ -108,40 +108,59 @@ async function handleApiData(request, env, ctx) {
 
 // ─── Asana fetch ──────────────────────────────────────────────────────────────
 
-// Fields fetched for open tasks — custom_fields and num_likes excluded (on hold)
-// to keep page count and payload small (~12 pages vs 23).
 const OPEN_FIELDS = [
   'gid','name','assignee.name',
   'completed','created_at','modified_at','due_on',
   'memberships.section.name',
 ].join(',');
 
-// Lighter field set for recently-completed snapshot (1 page only)
-const COMPLETED_FIELDS = [
-  'gid','name','assignee.name',
-  'completed','completed_at','created_at',
-  'memberships.section.name',
-].join(',');
+const EXCLUDED_SECTION_NAMES = new Set([
+  'High Impact (Week 1,3)',
+  'Post Incident Review (Week 2,4)',
+]);
 
-async function fetchOpenTasks(token) {
+// Fetch all sections for the project, then pull each section's tasks IN PARALLEL.
+// This cuts fetch time from ~30s sequential → ~5s parallel.
+async function fetchAndProcess(token) {
+  // 1. Get section list (1 fast API call)
+  const secResp = await fetch(
+    `${ASANA_API}/projects/${PROJECT_GID}/sections?opt_fields=gid,name&limit=100`,
+    { headers: { Authorization: `Bearer ${token}` } }
+  );
+  if (!secResp.ok) throw new Error(`Asana sections ${secResp.status}`);
+  const sections = (await secResp.json()).data
+    .filter(s => !EXCLUDED_SECTION_NAMES.has(s.name));
+
+  // 2. Fetch each section's open tasks in parallel
+  const [sectionResults, completedRaw] = await Promise.all([
+    Promise.all(sections.map(s => fetchSectionTasks(token, s.gid, s.name))),
+    fetchRecentCompleted(token),
+  ]);
+
+  const openRaw = sectionResults.flat();
+  return processData(openRaw, completedRaw);
+}
+
+async function fetchSectionTasks(token, sectionGid, sectionName) {
   const tasks  = [];
   let   offset = null;
   do {
     const params = new URLSearchParams({
-      project:    PROJECT_GID,
+      section:    sectionGid,
       opt_fields: OPEN_FIELDS,
-      completed:  'false',          // ← only open tasks (~half the pages)
+      completed:  'false',
       limit:      '100',
     });
     if (offset) params.set('offset', offset);
     const resp = await fetch(`${ASANA_API}/tasks?${params}`, {
       headers: { Authorization: `Bearer ${token}` },
     });
-    if (!resp.ok) {
-      const body = await resp.text().catch(() => '');
-      throw new Error(`Asana ${resp.status}: ${body.slice(0, 200)}`);
-    }
+    if (!resp.ok) return tasks; // skip failed sections rather than crash
     const json = await resp.json();
+    // Tag each task with its section name (memberships might be empty for section queries)
+    json.data.forEach(t => {
+      if (!t.memberships?.length) t._sectionName = sectionName;
+    });
     tasks.push(...json.data);
     offset = json.next_page?.offset ?? null;
   } while (offset);
@@ -149,32 +168,17 @@ async function fetchOpenTasks(token) {
 }
 
 async function fetchRecentCompleted(token) {
-  // Fetch 1 page (100 tasks) of recently completed — enough for the widget
   const params = new URLSearchParams({
     project:    PROJECT_GID,
-    opt_fields: COMPLETED_FIELDS,
+    opt_fields: 'gid,name,assignee.name,completed,completed_at,created_at,memberships.section.name',
     completed:  'true',
-    sort_by:    'completed_at',
-    sort_ascending: 'false',
     limit:      '100',
   });
   const resp = await fetch(`${ASANA_API}/tasks?${params}`, {
     headers: { Authorization: `Bearer ${token}` },
   });
   if (!resp.ok) return [];
-  const json = await resp.json();
-  return json.data;
-}
-
-// ─── Data processing ──────────────────────────────────────────────────────────
-
-async function fetchAndProcess(token) {
-  // Run both fetches concurrently
-  const [openRaw, completedRaw] = await Promise.all([
-    fetchOpenTasks(token),
-    fetchRecentCompleted(token),
-  ]);
-  return processData(openRaw, completedRaw);
+  return (await resp.json()).data;
 }
 
 // ON HOLD (add back when re-enabling Priority/Risk/Trend charts):
@@ -185,7 +189,7 @@ function processData(openRaw, completedRaw) {
   const in14  = new Date(today); in14.setUTCDate(in14.getUTCDate() + 14);
 
   const mapTask = (t, forceCompleted = false) => {
-    const section  = t.memberships?.[0]?.section?.name ?? 'Unknown';
+    const section  = t.memberships?.[0]?.section?.name ?? t._sectionName ?? 'Unknown';
     const assignee = t.assignee?.name ?? 'Unassigned';
     const due      = t.due_on ?? '';
     const dueDate  = due ? new Date(due + 'T00:00:00Z') : null;
@@ -203,14 +207,9 @@ function processData(openRaw, completedRaw) {
     };
   };
 
-  // These sections are meeting/review columns — excluded from all dashboard views
-  const EXCLUDED_SECTIONS = new Set([
-    'High Impact (Week 1,3)',
-    'Post Incident Review (Week 2,4)',
-  ]);
-
-  const tasks      = openRaw.map(t => mapTask(t, false)).filter(t => !EXCLUDED_SECTIONS.has(t.section));
-  const recentDone = completedRaw.map(t => mapTask(t, true)).filter(t => !EXCLUDED_SECTIONS.has(t.section));
+  const tasks      = openRaw.map(t => mapTask(t, false));
+  const recentDone = completedRaw.map(t => mapTask(t, true))
+    .filter(t => !EXCLUDED_SECTION_NAMES.has(t.section));
 
   // Open tasks only (main dataset)
   const open    = tasks; // all items in openRaw are completed=false
@@ -470,7 +469,7 @@ const HTML_SHELL = `<!DOCTYPE html>
 
 <div class="header">
   <div>
-    <h1>DTS Leadership Dashboard <span style="font-size:11px;font-weight:400;color:#4a5568;margin-left:8px">v14 · loading…</span></h1>
+    <h1>DTS Leadership Dashboard <span style="font-size:11px;font-weight:400;color:#4a5568;margin-left:8px">v15 · loading…</span></h1>
     <div class="sub">Western Health Digital &amp; Technology Services</div>
   </div>
   <div style="display:flex;align-items:center;gap:10px;flex-wrap:wrap">
@@ -478,7 +477,7 @@ const HTML_SHELL = `<!DOCTYPE html>
     <button class="theme-toggle" onclick="toggleTheme()" id="themeBtn">☀️ Light Mode</button>
     <span class="badge">LIVE</span>
     <span class="last-updated" id="lastUpdated">Loading…</span>
-    <button class="theme-toggle" onclick="try{localStorage.removeItem('dts-dash-v14')}catch(e){}location.reload()" style="font-size:12px;padding:4px 10px" title="Force-refresh from Asana (clears cache)">↻ Refresh</button>
+    <button class="theme-toggle" onclick="try{localStorage.removeItem('dts-dash-v15')}catch(e){}location.reload()" style="font-size:12px;padding:4px 10px" title="Force-refresh from Asana (clears cache)">↻ Refresh</button>
   </div>
 </div>
 
@@ -609,13 +608,13 @@ const HTML_SHELL = `<!DOCTYPE html>
 <script>
 // ── Global error traps (remove once dashboard is stable) ─────────────────────
 window.addEventListener('error', function(e) {
-  var el = document.getElementById('loadingMsg');
+  const el = document.getElementById('loadingMsg');
   if (el) el.innerHTML = '<div style="background:#3d1010;border:1px solid #fc8181;border-radius:8px;padding:16px;color:#fc8181;font-size:13px;text-align:left;max-width:600px;margin:0 auto">'
     + '<strong>JS Error:</strong> ' + e.message
     + '<br><small style="opacity:.7">' + (e.filename||'') + ':' + e.lineno + '</small></div>';
 });
 window.addEventListener('unhandledrejection', function(e) {
-  var el = document.getElementById('loadingMsg');
+  const el = document.getElementById('loadingMsg');
   if (el) el.innerHTML = '<div style="background:#3d1010;border:1px solid #fc8181;border-radius:8px;padding:16px;color:#fc8181;font-size:13px;text-align:left;max-width:600px;margin:0 auto">'
     + '<strong>Promise Error:</strong> ' + (e.reason||e) + '</div>';
 });
@@ -641,7 +640,7 @@ setBar(5);
 // Fetches /api/data (cached 5 min at edge) and drives a calibrated progress bar.
 // Each Asana page takes ~1s; ~23 pages total → ~23s cold, instant when cached.
 // localStorage cache key — bump version when data structure changes
-const LS_KEY     = 'dts-dash-v14';
+const LS_KEY     = 'dts-dash-v15';
 const LS_TTL_MS  = 5 * 60 * 1000; // 5 min
 
 function lsGet() {
@@ -687,7 +686,7 @@ function init() {
     setBar(100);
     try { populate(cached.data); } catch(e) { /* fall through to fresh fetch */ }
     const label = isFresh ? '⚡ cached' : '⚡ stale — refreshing';
-    document.querySelector('h1 span').textContent = 'v14 · ' + label;
+    document.querySelector('h1 span').textContent = 'v15 · ' + label;
 
     if (isFresh) return; // done — cache is fresh, no need to refetch
 
@@ -697,7 +696,7 @@ function init() {
       .then(data => {
         if (!data) return;
         lsPut(data);
-        document.querySelector('h1 span').textContent = 'v14 · refreshed';
+        document.querySelector('h1 span').textContent = 'v15 · refreshed';
       })
       .catch(() => {});
     return;
@@ -719,7 +718,7 @@ function init() {
       if (loadDiv) loadDiv.innerHTML = '<div class="load-title"><span class="spinner"></span>Rendering…</div>';
       try {
         populate(data);
-        document.querySelector('h1 span').textContent = 'v14 · loaded in ' + secs + 's';
+        document.querySelector('h1 span').textContent = 'v15 · loaded in ' + secs + 's';
       } catch(renderErr) {
         const ld = document.getElementById('loadingMsg');
         if (ld) ld.innerHTML = '<div class="load-title" style="color:#fc8181">⚠ Render error</div>'
