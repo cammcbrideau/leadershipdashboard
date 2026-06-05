@@ -2,4 +2,13 @@ name = "leadership-dashboard"
 main = "worker.js"
 compatibility_date = "2024-01-01"
 
-# Secret: run `npx wrangler secret put ASANA_TOKEN` once to set your Asana API token
+# Secrets: set via Cloudflare dashboard → Workers → Settings → Variables & Secrets
+#   ASANA_TOKEN      — Asana personal access token
+#   DASHBOARD_PASSWORD — login password for the dashboard
+
+# KV namespace for persistent cross-datacenter caching
+# To create: Cloudflare dashboard → Workers & Pages → KV → Create namespace → name it "DASHBOARD_CACHE"
+# Then paste the namespace ID below
+[[kv_namespaces]]
+binding = "KV"
+id = "7bf96416440b4cf9bb56395678a56cc0"

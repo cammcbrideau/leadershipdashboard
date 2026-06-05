@@ -12,11 +12,13 @@ const PROJECT_GID  = '1111174651444074';
 const ASANA_API    = 'https://app.asana.com/api/1.0';
 const CACHE_TTL_MS = 5 * 60 * 1000; // 5 minutes in ms
 
-// ─── In-memory cache (persists across requests in the same Worker isolate) ────
-// caches.default does NOT work on workers.dev — this module-level variable does.
-let memCache     = null;   // stringified JSON
-let memCacheTime = 0;      // epoch ms when cache was last written
-let memCacheFetching = false; // prevent stampede on concurrent cold requests
+// ─── Two-layer cache ──────────────────────────────────────────────────────────
+// L1: in-memory (instant, per-isolate — avoids KV reads on back-to-back requests)
+// L2: Workers KV  (global, persists across all isolates & data centres)
+// Falls back gracefully if KV is not yet configured (env.KV undefined).
+let memCache        = null;  // JSON string
+let memCacheTime    = 0;     // ms epoch
+let memCacheFetching = false;
 
 export default {
   async fetch(request, env, ctx) {
@@ -133,65 +135,65 @@ function handleDashboard(_request, env) {
 
 // ─── GET /api/data ────────────────────────────────────────────────────────────
 
+const KV_KEY     = 'dashboard-data-v1';
+const KV_TTL_SEC = 300; // 5 minutes
+
 async function handleApiData(request, env, ctx) {
   if (!env.ASANA_TOKEN) return jsonErr('ASANA_TOKEN secret is not configured.', 500);
 
-  const now    = Date.now();
-  const fresh  = memCache && (now - memCacheTime) < CACHE_TTL_MS;
+  const now = Date.now();
 
-  if (fresh) {
-    // Serve from in-memory cache instantly
-    return new Response(memCache, {
-      headers: {
-        'Content-Type': 'application/json;charset=UTF-8',
-        'Cache-Control': 'no-store',
-        'Access-Control-Allow-Origin': '*',
-        'X-Cache': 'HIT',
-        'X-Cache-Age': String(Math.round((now - memCacheTime) / 1000)) + 's',
-      },
-    });
+  // ── L1: in-memory (same isolate, instant) ───────────────────────────────────
+  if (memCache && (now - memCacheTime) < CACHE_TTL_MS) {
+    return jsonResp(memCache, 'MEM');
   }
 
-  // Cache miss or expired — fetch from Asana
-  // If another request is already fetching, wait briefly then serve stale if available
-  if (memCacheFetching && memCache) {
-    return new Response(memCache, {
-      headers: {
-        'Content-Type': 'application/json;charset=UTF-8',
-        'Access-Control-Allow-Origin': '*',
-        'X-Cache': 'STALE',
-      },
-    });
+  // ── L2: Workers KV (global, ~5ms) ───────────────────────────────────────────
+  if (env.KV) {
+    try {
+      const kvVal = await env.KV.get(KV_KEY);
+      if (kvVal) {
+        // Warm the in-memory cache so subsequent requests in this isolate skip KV
+        memCache     = kvVal;
+        memCacheTime = now;
+        return jsonResp(kvVal, 'KV');
+      }
+    } catch (_) { /* KV unavailable — fall through to fetch */ }
   }
+
+  // ── Prevent concurrent cold-start stampede ──────────────────────────────────
+  if (memCacheFetching && memCache) return jsonResp(memCache, 'STALE');
 
   memCacheFetching = true;
   try {
-    const data = await fetchAndProcess(env.ASANA_TOKEN);
-    memCache      = JSON.stringify(data);
-    memCacheTime  = Date.now();
-    return new Response(memCache, {
-      headers: {
-        'Content-Type': 'application/json;charset=UTF-8',
-        'Cache-Control': 'no-store',
-        'Access-Control-Allow-Origin': '*',
-        'X-Cache': 'MISS',
-      },
-    });
-  } catch (err) {
-    // On error, serve stale cache if we have it rather than failing
-    if (memCache) {
-      return new Response(memCache, {
-        headers: {
-          'Content-Type': 'application/json;charset=UTF-8',
-          'Access-Control-Allow-Origin': '*',
-          'X-Cache': 'STALE-ERROR',
-        },
-      });
+    const data    = await fetchAndProcess(env.ASANA_TOKEN);
+    const payload = JSON.stringify(data);
+
+    // Write to both caches
+    memCache     = payload;
+    memCacheTime = Date.now();
+    if (env.KV) {
+      ctx.waitUntil(env.KV.put(KV_KEY, payload, { expirationTtl: KV_TTL_SEC }));
     }
+
+    return jsonResp(payload, 'MISS');
+  } catch (err) {
+    if (memCache) return jsonResp(memCache, 'STALE-ERR');
     return jsonErr(String(err), 502);
   } finally {
     memCacheFetching = false;
   }
+}
+
+function jsonResp(body, cacheStatus) {
+  return new Response(body, {
+    headers: {
+      'Content-Type':  'application/json;charset=UTF-8',
+      'Cache-Control': 'no-store',
+      'Access-Control-Allow-Origin': '*',
+      'X-Cache': cacheStatus,
+    },
+  });
 }
 
 // ─── Asana fetch ──────────────────────────────────────────────────────────────
@@ -605,7 +607,7 @@ const HTML_SHELL = `<!DOCTYPE html>
 
 <div class="header">
   <div>
-    <h1>DTS Leadership Dashboard <span style="font-size:11px;font-weight:400;color:#4a5568;margin-left:8px">v22 · loading…</span></h1>
+    <h1>DTS Leadership Dashboard <span style="font-size:11px;font-weight:400;color:#4a5568;margin-left:8px">v23 · loading…</span></h1>
     <div class="sub">Western Health Digital &amp; Technology Services</div>
   </div>
   <div style="display:flex;align-items:center;gap:10px;flex-wrap:wrap">
@@ -613,7 +615,7 @@ const HTML_SHELL = `<!DOCTYPE html>
     <button class="theme-toggle" onclick="toggleTheme()" id="themeBtn">☀️ Light Mode</button>
     <span class="badge">LIVE</span>
     <span class="last-updated" id="lastUpdated">Loading…</span>
-    <button class="theme-toggle" onclick="try{localStorage.removeItem('dts-dash-v22')}catch(e){}location.reload()" style="font-size:12px;padding:4px 10px" title="Force-refresh from Asana (clears cache)">↻ Refresh</button>
+    <button class="theme-toggle" onclick="try{localStorage.removeItem('dts-dash-v23')}catch(e){}location.reload()" style="font-size:12px;padding:4px 10px" title="Force-refresh from Asana (clears cache)">↻ Refresh</button>
   </div>
 </div>
 
@@ -781,7 +783,7 @@ setBar(5);
 // Fetches /api/data (cached 5 min at edge) and drives a calibrated progress bar.
 // Each Asana page takes ~1s; ~23 pages total → ~23s cold, instant when cached.
 // localStorage cache key — bump version when data structure changes
-const LS_KEY     = 'dts-dash-v22';
+const LS_KEY     = 'dts-dash-v23';
 const LS_TTL_MS  = 5 * 60 * 1000; // 5 min
 
 function lsGet() {
@@ -827,7 +829,7 @@ function init() {
     setBar(100);
     try { populate(cached.data); } catch(e) { /* fall through to fresh fetch */ }
     const label = isFresh ? '⚡ cached' : '⚡ stale — refreshing';
-    document.querySelector('h1 span').textContent = 'v22 · ' + label;
+    document.querySelector('h1 span').textContent = 'v23 · ' + label;
 
     if (isFresh) return; // done — cache is fresh, no need to refetch
 
@@ -837,7 +839,7 @@ function init() {
       .then(data => {
         if (!data) return;
         lsPut(data);
-        document.querySelector('h1 span').textContent = 'v22 · refreshed';
+        document.querySelector('h1 span').textContent = 'v23 · refreshed';
       })
       .catch(() => {});
     return;
@@ -859,7 +861,7 @@ function init() {
       if (loadDiv) loadDiv.innerHTML = '<div class="load-title"><span class="spinner"></span>Rendering…</div>';
       try {
         populate(data);
-        document.querySelector('h1 span').textContent = 'v22 · loaded in ' + secs + 's';
+        document.querySelector('h1 span').textContent = 'v23 · loaded in ' + secs + 's';
       } catch(renderErr) {
         const ld = document.getElementById('loadingMsg');
         if (ld) ld.innerHTML = '<div class="load-title" style="color:#fc8181">⚠ Render error</div>'
