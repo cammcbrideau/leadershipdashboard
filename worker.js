@@ -596,13 +596,22 @@ function init() {
     .then(data => {
       clearInterval(ticker);
       setBar(100);
-      populate(data);
+      msg.textContent = '⚙️ Rendering dashboard…';
+      try {
+        populate(data);
+      } catch(renderErr) {
+        msg.innerHTML = '<span style="color:#fc8181;font-size:13px">⚠ Render error: '
+          + renderErr.message + '<br><code style="font-size:11px;opacity:.7">'
+          + (renderErr.stack||'').split('\n').slice(0,3).join('<br>')
+          + '</code></span><br><br>'
+          + '<button class="theme-toggle" onclick="init()">↻ Retry</button>';
+      }
     })
     .catch(err => {
       clearInterval(ticker);
       setBar(0);
       msg.innerHTML =
-        '<span style="color:#fc8181">⚠ Failed to load data: ' + err.message + '</span><br><br>' +
+        '<span style="color:#fc8181">⚠ Failed to fetch data: ' + err.message + '</span><br><br>' +
         '<button class="theme-toggle" onclick="init()">↻ Retry</button>';
     });
 }
