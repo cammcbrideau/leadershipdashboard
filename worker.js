@@ -607,6 +607,21 @@ const HTML_SHELL = `<!DOCTYPE html>
 </div>
 
 <script>
+// ── Global error traps (remove once dashboard is stable) ─────────────────────
+window.addEventListener('error', function(e) {
+  var el = document.getElementById('loadingMsg');
+  if (el) el.innerHTML = '<div style="background:#3d1010;border:1px solid #fc8181;border-radius:8px;padding:16px;color:#fc8181;font-size:13px;text-align:left;max-width:600px;margin:0 auto">'
+    + '<strong>JS Error:</strong> ' + e.message
+    + '<br><small style="opacity:.7">' + (e.filename||'') + ':' + e.lineno + '</small></div>';
+});
+window.addEventListener('unhandledrejection', function(e) {
+  var el = document.getElementById('loadingMsg');
+  if (el) el.innerHTML = '<div style="background:#3d1010;border:1px solid #fc8181;border-radius:8px;padding:16px;color:#fc8181;font-size:13px;text-align:left;max-width:600px;margin:0 auto">'
+    + '<strong>Promise Error:</strong> ' + (e.reason||e) + '</div>';
+});
+// Immediate proof-of-life: if JS runs at all this changes the counter text
+document.getElementById('loadSecs').textContent = 'JS';
+
 const ASANA_BASE  = 'https://app.asana.com/0/${PROJECT_GID}';
 const SECTION_ABBR = {'New Business':'NB','Action 5 days':'A5','Action 10 days':'A10','Action 30+ days':'A30','Action 90+ days':'A90'};
 
