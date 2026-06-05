@@ -101,7 +101,7 @@ function showLoginPage(next = '/', failed = false) {
 <div class="card">
   <div class="badge">LIVE</div>
   <h1>DTS Leadership Dashboard</h1>
-  <div class="sub">Western Health Digital &amp; Technology Services</div>
+  <div class="sub">Western Health Digital Technology Services</div>
   ${failed ? '<div class="error">Incorrect password — try again</div>' : ''}
   <form method="POST" action="/login">
     <input type="password" name="password" placeholder="Enter password" autofocus autocomplete="current-password">
@@ -600,7 +600,7 @@ const HTML_SHELL = `<!DOCTYPE html>
   @media(max-width:600px){.kpi-grid{grid-template-columns:repeat(2,1fr)}.row-4,.row-3,.row-2{grid-template-columns:1fr}}
 </style>
 </head>
-<body class="hide-completed">
+<body class="hide-completed light">
 
 <!-- Top loading bar -->
 <div id="loadingBar" style="position:fixed;top:0;left:0;height:3px;width:0;background:linear-gradient(90deg,#4299e1,#9f7aea,#e879f9);z-index:99999;transition:width .6s ease,opacity .4s"></div>
@@ -608,11 +608,11 @@ const HTML_SHELL = `<!DOCTYPE html>
 <div class="header">
   <div>
     <h1>DTS Leadership Dashboard <span style="font-size:11px;font-weight:400;color:#4a5568;margin-left:8px">v23 · loading…</span></h1>
-    <div class="sub">Western Health Digital &amp; Technology Services</div>
+    <div class="sub">Western Health Digital Technology Services</div>
   </div>
   <div style="display:flex;align-items:center;gap:10px;flex-wrap:wrap">
     <button class="toggle-hide-btn active" id="hideCompletedBtn" onclick="toggleHideCompleted()">Hide Completed</button>
-    <button class="theme-toggle" onclick="toggleTheme()" id="themeBtn">☀️ Light Mode</button>
+    <button class="theme-toggle" onclick="toggleTheme()" id="themeBtn">🌙 Dark Mode</button>
     <span class="badge">LIVE</span>
     <span class="last-updated" id="lastUpdated">Loading…</span>
     <button class="theme-toggle" onclick="try{localStorage.removeItem('dts-dash-v23')}catch(e){}location.reload()" style="font-size:12px;padding:4px 10px" title="Force-refresh from Asana (clears cache)">↻ Refresh</button>
