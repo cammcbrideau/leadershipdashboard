@@ -200,17 +200,20 @@ const OPEN_FIELDS = [
   'gid','name','assignee.name',
   'completed','created_at','modified_at','due_on',
   'memberships.section.name',
+  'custom_fields.name','custom_fields.display_value', // for priority/risk charts
 ].join(',');
+
+// Minimal fields for completed tasks — just enough for trend chart + donut Done count
+const DONE_DATE_FIELDS = 'gid,created_at,completed_at';
 
 const EXCLUDED_SECTION_NAMES = new Set([
   'High Impact (Week 1,3)',
   'Post Incident Review (Week 2,4)',
 ]);
 
-// Fetch all sections for the project, then pull each section's tasks IN PARALLEL.
-// This cuts fetch time from ~30s sequential → ~5s parallel.
+// Fetch all sections then pull open tasks + completed dates IN PARALLEL.
 async function fetchAndProcess(token) {
-  // 1. Get section list (1 fast API call)
+  // 1. Get section list (1 API call)
   const secResp = await fetch(
     `${ASANA_API}/projects/${PROJECT_GID}/sections?opt_fields=gid,name&limit=100`,
     { headers: { Authorization: `Bearer ${token}` } }
@@ -219,36 +222,38 @@ async function fetchAndProcess(token) {
   const sections = (await secResp.json()).data
     .filter(s => !EXCLUDED_SECTION_NAMES.has(s.name));
 
-  // 2. Fetch each section's open tasks in parallel
-  const [sectionResults, completedRaw] = await Promise.all([
-    Promise.all(sections.map(s => fetchSectionTasks(token, s.gid, s.name))),
+  // 2. Parallel: open tasks per section + completed dates per section + recent completed widget
+  const [openResults, doneResults, recentCompleted] = await Promise.all([
+    Promise.all(sections.map(s => fetchSectionTasks(token, s.gid, s.name, false))),
+    Promise.all(sections.map(s => fetchSectionTasks(token, s.gid, s.name, true))),
     fetchRecentCompleted(token),
   ]);
 
-  const openRaw = sectionResults.flat();
-  return processData(openRaw, completedRaw);
+  return processData(openResults.flat(), doneResults.flat(), recentCompleted);
 }
 
-async function fetchSectionTasks(token, sectionGid, sectionName) {
+async function fetchSectionTasks(token, sectionGid, sectionName, completed) {
+  const fields = completed ? DONE_DATE_FIELDS : OPEN_FIELDS;
   const tasks  = [];
   let   offset = null;
   do {
     const params = new URLSearchParams({
       section:    sectionGid,
-      opt_fields: OPEN_FIELDS,
-      completed:  'false',
+      opt_fields: fields,
+      completed:  String(completed),
       limit:      '100',
     });
     if (offset) params.set('offset', offset);
     const resp = await fetch(`${ASANA_API}/tasks?${params}`, {
       headers: { Authorization: `Bearer ${token}` },
     });
-    if (!resp.ok) return tasks; // skip failed sections rather than crash
+    if (!resp.ok) return tasks;
     const json = await resp.json();
-    // Tag each task with its section name (memberships might be empty for section queries)
-    json.data.forEach(t => {
-      if (!t.memberships?.length) t._sectionName = sectionName;
-    });
+    if (!completed) {
+      json.data.forEach(t => {
+        if (!t.memberships?.length) t._sectionName = sectionName;
+      });
+    }
     tasks.push(...json.data);
     offset = json.next_page?.offset ?? null;
   } while (offset);
@@ -269,54 +274,71 @@ async function fetchRecentCompleted(token) {
   return (await resp.json()).data;
 }
 
-// ON HOLD (add back when re-enabling Priority/Risk/Trend charts):
-// custom_fields (priority, consequence, reversibility), num_likes, completed history
-
-function processData(openRaw, completedRaw) {
+function processData(openRaw, doneDatesRaw, recentCompletedRaw) {
   const today = new Date(); today.setUTCHours(0,0,0,0);
   const in14  = new Date(today); in14.setUTCDate(in14.getUTCDate() + 14);
 
-  const mapTask = (t, forceCompleted = false) => {
+  const mapTask = t => {
     const section  = t.memberships?.[0]?.section?.name ?? t._sectionName ?? 'Unknown';
     const assignee = t.assignee?.name ?? 'Unassigned';
     const due      = t.due_on ?? '';
     const dueDate  = due ? new Date(due + 'T00:00:00Z') : null;
-    const completed = forceCompleted || t.completed;
-    const overdue  = !completed && !!dueDate && dueDate < today;
-    const dueSoon  = !completed && !overdue && !!dueDate && dueDate <= in14;
+    const overdue  = !!dueDate && dueDate < today;
+    const dueSoon  = !overdue && !!dueDate && dueDate <= in14;
+
+    let priority = null, consequence = null, reversibility = null;
+    for (const cf of t.custom_fields ?? []) {
+      if (!cf.display_value) continue;
+      if      (cf.name === 'Priority')      priority      = cf.display_value;
+      else if (cf.name === 'Consequence')   consequence   = cf.display_value;
+      else if (cf.name === 'Reversibility') reversibility = cf.display_value;
+    }
     return {
       gid: t.gid, name: t.name, assignee, section, due,
-      created:     (t.created_at   ?? '').slice(0,10),
-      completedAt: (t.completed_at ?? '').slice(0,10),
-      modified:    (t.modified_at  ?? '').slice(0,10),
-      completed, overdue, dueSoon,
-      // custom_fields on hold — priority/consequence/reversibility not fetched
-      priority: null, consequence: null, reversibility: null,
+      created:  (t.created_at  ?? '').slice(0,10),
+      modified: (t.modified_at ?? '').slice(0,10),
+      completed: false, completedAt: '', overdue, dueSoon,
+      priority, consequence, reversibility,
     };
   };
 
-  const tasks      = openRaw.map(t => mapTask(t, false));
-  const recentDone = completedRaw.map(t => mapTask(t, true))
-    .filter(t => !EXCLUDED_SECTION_NAMES.has(t.section));
-
-  // Open tasks only (main dataset)
-  const open    = tasks; // all items in openRaw are completed=false
+  const tasks   = openRaw.map(mapTask);
+  const open    = tasks;
   const overdue = open.filter(t => t.overdue);
   const dueSoon = open.filter(t => t.dueSoon);
-  const members = new Set(
-    [...tasks, ...recentDone].filter(t => t.assignee !== 'Unassigned').map(t => t.assignee)
-  ).size;
 
-  // KPIs — open count is exact; completed is approximate (we only fetched 100 recent)
+  // doneDatesRaw has only gid, created_at, completed_at (minimal fields)
+  const doneCount = doneDatesRaw.length;
+  const total     = tasks.length + doneCount;
+  const members   = new Set(tasks.filter(t => t.assignee !== 'Unassigned').map(t => t.assignee)).size;
+
   const kpis = {
-    total:          tasks.length,   // open task count (completed count not fetched)
-    completed:      recentDone.length,
-    open:           tasks.length,
-    overdue:        overdue.length,
-    dueSoon:        dueSoon.length,
-    members,
-    completionRate: '—',            // not available without full history
-    openRate:       '100',          // all fetched tasks are open
+    total, completed: doneCount, open: tasks.length,
+    overdue: overdue.length, dueSoon: dueSoon.length, members,
+    completionRate: total ? ((doneCount / total) * 100).toFixed(1) : '0',
+    openRate:       total ? ((tasks.length / total) * 100).toFixed(1) : '0',
+  };
+
+  // Trend chart — combine open created_at + done created_at & completed_at
+  const mCr = {}, mCo = {};
+  for (const t of tasks)      if (t.created) { const m=t.created.slice(0,7); mCr[m]=(mCr[m]??0)+1; }
+  for (const t of doneDatesRaw) {
+    if (t.created_at)   { const m=t.created_at.slice(0,7);   mCr[m]=(mCr[m]??0)+1; }
+    if (t.completed_at) { const m=t.completed_at.slice(0,7); mCo[m]=(mCo[m]??0)+1; }
+  }
+  const months    = [...new Set([...Object.keys(mCr),...Object.keys(mCo)])].sort().slice(-24);
+  const created_m = months.map(m => mCr[m]??0);
+  const compl_m   = months.map(m => mCo[m]??0);
+
+  // Priority / risk counts (open tasks only — custom_fields now re-enabled)
+  const pc = {
+    high:          open.filter(t=>t.priority==='High').length,
+    medium:        open.filter(t=>t.priority==='Medium').length,
+    low:           open.filter(t=>t.priority==='Low').length,
+    highConseq:    open.filter(t=>t.consequence?.includes('High')).length,
+    lowConseq:     open.filter(t=>t.consequence?.includes('Low')).length,
+    reversible:    open.filter(t=>t.reversibility==='Reversible').length,
+    notReversible: open.filter(t=>t.reversibility==='Not reversible').length,
   };
 
   const recentlyAdded = tasks
@@ -343,7 +365,7 @@ function processData(openRaw, completedRaw) {
 
   const sMap = {};
   for (const t of tasks) {
-    if (!sMap[t.section]) sMap[t.section]={total:0,done:0};
+    if (!sMap[t.section]) sMap[t.section]={total:0};
     sMap[t.section].total++;
   }
   const topSections = Object.entries(sMap)
@@ -361,19 +383,25 @@ function processData(openRaw, completedRaw) {
       assignee:t.assignee,section:t.section}))
     .sort((a,b)=>b.age-a.age);
 
-  const recentCompleted = recentDone
-    .filter(t=>t.completedAt&&t.assignee!=='Unassigned')
-    .sort((a,b)=>b.completedAt.localeCompare(a.completedAt)).slice(0,20)
-    .map(({gid,name,assignee,completedAt,section})=>({gid,name,assignee,completedAt,section}));
+  // Recent completed widget uses the full recentCompletedRaw (with names/assignees)
+  const recentCompleted = recentCompletedRaw
+    .filter(t=>t.completed_at&&t.assignee?.name&&t.assignee.name!=='Unassigned')
+    .slice(0,20)
+    .map(t=>({
+      gid:t.gid, name:t.name,
+      assignee:  t.assignee?.name ?? 'Unassigned',
+      completedAt:(t.completed_at??'').slice(0,10),
+      section:   t.memberships?.[0]?.section?.name ?? '',
+    }));
 
   const sectionHtml = buildSectionHtml(open);
 
   return {
     kpis, recentlyAdded, recentlyCommented, assignees,
-    kpiData: tasks, dowCreated, topSections,
+    kpiData: tasks, months, created: created_m, completed: compl_m,
+    dowCreated, topSections, priorityCounts: pc,
     wordCloud, oldestTasks, recentCompleted, sectionHtml,
     generatedAt: new Date().toISOString(),
-    // ON HOLD: months/created/completed (trend chart), priorityCounts, likesData
   };
 }
 
@@ -560,7 +588,7 @@ const HTML_SHELL = `<!DOCTYPE html>
 
 <div class="header">
   <div>
-    <h1>DTS Leadership Dashboard <span style="font-size:11px;font-weight:400;color:#4a5568;margin-left:8px">v17 · loading…</span></h1>
+    <h1>DTS Leadership Dashboard <span style="font-size:11px;font-weight:400;color:#4a5568;margin-left:8px">v18 · loading…</span></h1>
     <div class="sub">Western Health Digital &amp; Technology Services</div>
   </div>
   <div style="display:flex;align-items:center;gap:10px;flex-wrap:wrap">
@@ -568,7 +596,7 @@ const HTML_SHELL = `<!DOCTYPE html>
     <button class="theme-toggle" onclick="toggleTheme()" id="themeBtn">☀️ Light Mode</button>
     <span class="badge">LIVE</span>
     <span class="last-updated" id="lastUpdated">Loading…</span>
-    <button class="theme-toggle" onclick="try{localStorage.removeItem('dts-dash-v17')}catch(e){}location.reload()" style="font-size:12px;padding:4px 10px" title="Force-refresh from Asana (clears cache)">↻ Refresh</button>
+    <button class="theme-toggle" onclick="try{localStorage.removeItem('dts-dash-v18')}catch(e){}location.reload()" style="font-size:12px;padding:4px 10px" title="Force-refresh from Asana (clears cache)">↻ Refresh</button>
   </div>
 </div>
 
@@ -613,16 +641,22 @@ const HTML_SHELL = `<!DOCTYPE html>
     </div>
   </div>
 
-  <!-- Charts row 1 -->
-  <div class="charts-row row-4" style="margin-bottom:20px">
-    <div class="card"><h2><span class="dot" style="background:#4299e1"></span>Task Status</h2><div style="position:relative;height:180px"><canvas id="donutChart"></canvas></div><div style="display:flex;justify-content:center;gap:16px;margin-top:12px;flex-wrap:wrap"><span style="font-size:11px;color:#48bb78">● Completed</span><span style="font-size:11px;color:#4299e1">● Open</span><span style="font-size:11px;color:#fc8181">● Overdue</span></div></div>
-    <!-- Priority & Risk + Reversibility charts on hold (custom_fields not fetched) -->
-    <div class="card"><h2><span class="dot" style="background:#9f7aea"></span>Top Assignees</h2><div style="position:relative;height:200px"><canvas id="assigneeChart"></canvas></div></div>
+  <!-- Charts row 1: Task Completion + Custom Field Breakdown + Risk Profile -->
+  <div class="charts-row row-3" style="margin-bottom:20px">
+    <div class="card">
+      <h2><span class="dot" style="background:#48bb78"></span>Task Completion</h2>
+      <div style="position:relative;height:200px"><canvas id="donutChart"></canvas></div>
+      <div style="display:flex;justify-content:center;gap:16px;margin-top:10px;flex-wrap:wrap;font-size:11px">
+        <span style="color:#48bb78">● Done</span><span style="color:#4299e1">● Open</span><span style="font-size:11px;color:#fc8181">● Overdue</span>
+      </div>
+    </div>
+    <div class="card"><h2><span class="dot" style="background:#e879f9"></span>Custom Field Breakdown</h2><div style="position:relative;height:220px"><canvas id="priorityChart"></canvas></div></div>
+    <div class="card"><h2><span class="dot" style="background:#9f7aea"></span>Risk Profile</h2><div style="position:relative;height:220px"><canvas id="riskChart"></canvas></div></div>
   </div>
 
-  <!-- Trend -->
+  <!-- Task Activity trend -->
   <div class="charts-row row-1" style="margin-bottom:20px">
-    <!-- Task Trend (Monthly) on hold — requires full completed-task history -->
+    <div class="card"><h2><span class="dot" style="background:#63b3ed"></span>Task Activity — Last 24 Months</h2><div style="position:relative;height:220px"><canvas id="trendChart"></canvas></div></div>
   </div>
 
   <!-- Section + Overdue -->
@@ -731,7 +765,7 @@ setBar(5);
 // Fetches /api/data (cached 5 min at edge) and drives a calibrated progress bar.
 // Each Asana page takes ~1s; ~23 pages total → ~23s cold, instant when cached.
 // localStorage cache key — bump version when data structure changes
-const LS_KEY     = 'dts-dash-v17';
+const LS_KEY     = 'dts-dash-v18';
 const LS_TTL_MS  = 5 * 60 * 1000; // 5 min
 
 function lsGet() {
@@ -777,7 +811,7 @@ function init() {
     setBar(100);
     try { populate(cached.data); } catch(e) { /* fall through to fresh fetch */ }
     const label = isFresh ? '⚡ cached' : '⚡ stale — refreshing';
-    document.querySelector('h1 span').textContent = 'v17 · ' + label;
+    document.querySelector('h1 span').textContent = 'v18 · ' + label;
 
     if (isFresh) return; // done — cache is fresh, no need to refetch
 
@@ -787,7 +821,7 @@ function init() {
       .then(data => {
         if (!data) return;
         lsPut(data);
-        document.querySelector('h1 span').textContent = 'v17 · refreshed';
+        document.querySelector('h1 span').textContent = 'v18 · refreshed';
       })
       .catch(() => {});
     return;
@@ -809,7 +843,7 @@ function init() {
       if (loadDiv) loadDiv.innerHTML = '<div class="load-title"><span class="spinner"></span>Rendering…</div>';
       try {
         populate(data);
-        document.querySelector('h1 span').textContent = 'v17 · loaded in ' + secs + 's';
+        document.querySelector('h1 span').textContent = 'v18 · loaded in ' + secs + 's';
       } catch(renderErr) {
         const ld = document.getElementById('loadingMsg');
         if (ld) ld.innerHTML = '<div class="load-title" style="color:#fc8181">⚠ Render error</div>'
@@ -997,20 +1031,76 @@ function renderWordCloud(wordCloudData) {
 const chartPointer = (e, els) => { e.native.target.style.cursor = els.length ? 'pointer' : 'default'; };
 
 function initCharts(data) {
-  const k = data.kpis;
+  const k  = data.kpis;
+  const pc = data.priorityCounts;
 
-  // Donut — open vs overdue (no completed count in this mode)
-  new Chart(document.getElementById('donutChart'), {
+  // 1. Donut — Done / Open / Overdue with centre label
+  const donutChart = new Chart(document.getElementById('donutChart'), {
     type: 'doughnut',
-    data: { labels:['Open','Overdue'], datasets:[{data:[k.open - k.overdue, k.overdue],backgroundColor:['#4299e1','#fc8181'],borderColor:'transparent',borderWidth:0,spacing:4,hoverOffset:18,borderRadius:4}] },
-    options: { cutout:'74%', plugins:{ legend:{display:false}, tooltip:{callbacks:{label:ctx=>{const tot=ctx.dataset.data.reduce((a,b)=>a+b,0);return ' '+ctx.label+': '+ctx.raw+' ('+((ctx.raw/tot)*100).toFixed(1)+'%)'}},backgroundColor:'rgba(15,17,23,.9)',titleColor:'#e2e8f0',bodyColor:'#a0aec0',borderColor:'#2d3748',borderWidth:1,padding:10,cornerRadius:8}},
+    data: { labels:['Done '+k.completed,'Open '+(k.open-k.overdue),'Overdue '+k.overdue],
+            datasets:[{data:[k.completed, k.open-k.overdue, k.overdue],
+              backgroundColor:['#48bb78','#4299e1','#fc8181'],
+              borderColor:'transparent',borderWidth:0,spacing:3,hoverOffset:14,borderRadius:4}] },
+    options: { cutout:'72%',
+      plugins:{
+        legend:{display:true,position:'bottom',labels:{color:'#a0aec0',usePointStyle:true,pointStyleWidth:8,padding:14,font:{size:11}}},
+        tooltip:{callbacks:{label:ctx=>{const tot=ctx.dataset.data.reduce((a,b)=>a+b,0);return ' '+ctx.raw+' ('+((ctx.raw/tot)*100).toFixed(1)+'%)'}},
+          backgroundColor:'rgba(15,17,23,.9)',titleColor:'#e2e8f0',bodyColor:'#a0aec0',borderColor:'#2d3748',borderWidth:1,padding:10,cornerRadius:8},
+      },
       animation:{animateRotate:true,animateScale:true,duration:700,easing:'easeOutQuart'},
       responsive:true, maintainAspectRatio:false,
-      onClick:(e,els,chart)=>{ if(!els.length)return; const lb=chart.data.labels[els[0].index]; const m={Open:t=>!t.overdue,Overdue:t=>t.overdue}; openModalWith(lb+' Tasks',kpiData.filter(m[lb]||(()=>true))); },
+      onClick:(e,els,chart)=>{ if(!els.length)return; const i=els[0].index; const labels=['Done','Open','Overdue']; const fns=[t=>t.completed,t=>!t.completed&&!t.overdue,t=>t.overdue]; openModalWith(labels[i]+' Tasks',kpiData.filter(fns[i])); },
       onHover:chartPointer }
   });
+  // Draw centre label
+  Chart.register({id:'donutCentre',beforeDraw(chart){
+    if(chart.canvas.id!=='donutChart') return;
+    const {ctx,chartArea:{top,bottom,left,right}}=chart;
+    const cx=(left+right)/2, cy=(top+bottom)/2;
+    ctx.save();
+    ctx.textAlign='center'; ctx.textBaseline='middle';
+    ctx.fillStyle='#48bb78'; ctx.font='bold 22px sans-serif';
+    ctx.fillText(k.completionRate+'%', cx, cy-8);
+    ctx.fillStyle='#a0aec0'; ctx.font='11px sans-serif';
+    ctx.fillText('COMPLETE', cx, cy+12);
+    ctx.restore();
+  }});
 
-  // Top assignees mini (open tasks only)
+  // 2. Custom Field Breakdown (Priority + Consequence)
+  new Chart(document.getElementById('priorityChart'), {
+    type:'bar',
+    data:{ labels:['High Priority','Medium Priority','Low Priority','High Consequence','Low Consequence'],
+           datasets:[{label:'Tasks',data:[pc.high,pc.medium,pc.low,pc.highConseq,pc.lowConseq],
+             backgroundColor:['#fc8181','#ecc94b','#68d391','#f6ad55','#4299e1'],borderRadius:6,borderSkipped:false}] },
+    options:{ indexAxis:'y', plugins:{legend:{display:false}},
+      scales:{x:{grid:{color:'#2d3748'},ticks:{color:'#718096'}},y:{grid:{display:false},ticks:{color:'#a0aec0'}}},
+      responsive:true, maintainAspectRatio:false }
+  });
+
+  // 3. Risk Profile (Reversibility)
+  new Chart(document.getElementById('riskChart'), {
+    type:'bar',
+    data:{ labels:['Reversible','Not Reversible'],
+           datasets:[{label:'Tasks',data:[pc.reversible,pc.notReversible],backgroundColor:['#48bb78','#fc8181'],borderRadius:6,borderSkipped:false}] },
+    options:{ indexAxis:'y', plugins:{legend:{display:false}},
+      scales:{x:{grid:{color:'#2d3748'},ticks:{color:'#718096'}},y:{grid:{display:false},ticks:{color:'#a0aec0'}}},
+      responsive:true, maintainAspectRatio:false }
+  });
+
+  // 4. Task Activity trend
+  new Chart(document.getElementById('trendChart'), {
+    type:'line',
+    data:{ labels:data.months,
+      datasets:[
+        {label:'Created',  data:data.created,   borderColor:'#4299e1',backgroundColor:'rgba(66,153,225,.1)', fill:true,tension:.4,pointRadius:3,pointBackgroundColor:'#4299e1'},
+        {label:'Completed',data:data.completed, borderColor:'#48bb78',backgroundColor:'rgba(72,187,120,.1)', fill:true,tension:.4,pointRadius:3,pointBackgroundColor:'#48bb78'},
+      ]},
+    options:{ plugins:{legend:{position:'top',labels:{color:'#a0aec0',usePointStyle:true,pointStyleWidth:8}}},
+      scales:{x:{grid:{color:'#1e2538'},ticks:{color:'#4a5568',maxRotation:45}},y:{grid:{color:'#2d3748'},ticks:{color:'#718096'},beginAtZero:true}},
+      responsive:true, maintainAspectRatio:false }
+  });
+
+  // 5. Top assignees mini (open tasks only)
   const topA = data.assignees.slice(0,12);
   new Chart(document.getElementById('assigneeChart'), {
     type:'bar',
