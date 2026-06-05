@@ -605,7 +605,7 @@ const HTML_SHELL = `<!DOCTYPE html>
 
 <div class="header">
   <div>
-    <h1>DTS Leadership Dashboard <span style="font-size:11px;font-weight:400;color:#4a5568;margin-left:8px">v21 · loading…</span></h1>
+    <h1>DTS Leadership Dashboard <span style="font-size:11px;font-weight:400;color:#4a5568;margin-left:8px">v22 · loading…</span></h1>
     <div class="sub">Western Health Digital &amp; Technology Services</div>
   </div>
   <div style="display:flex;align-items:center;gap:10px;flex-wrap:wrap">
@@ -613,7 +613,7 @@ const HTML_SHELL = `<!DOCTYPE html>
     <button class="theme-toggle" onclick="toggleTheme()" id="themeBtn">☀️ Light Mode</button>
     <span class="badge">LIVE</span>
     <span class="last-updated" id="lastUpdated">Loading…</span>
-    <button class="theme-toggle" onclick="try{localStorage.removeItem('dts-dash-v21')}catch(e){}location.reload()" style="font-size:12px;padding:4px 10px" title="Force-refresh from Asana (clears cache)">↻ Refresh</button>
+    <button class="theme-toggle" onclick="try{localStorage.removeItem('dts-dash-v22')}catch(e){}location.reload()" style="font-size:12px;padding:4px 10px" title="Force-refresh from Asana (clears cache)">↻ Refresh</button>
   </div>
 </div>
 
@@ -679,7 +679,7 @@ const HTML_SHELL = `<!DOCTYPE html>
   <!-- Section + Overdue -->
   <div class="charts-row row-2" style="margin-bottom:20px">
     <div class="card"><h2><span class="dot" style="background:#f6ad55"></span>Tasks by Section</h2><div style="position:relative;height:220px"><canvas id="sectionChart"></canvas></div></div>
-    <div class="card"><h2><span class="dot" style="background:#fc8181"></span>Overdue Tasks</h2><table class="overdue-table"><thead><tr><th>Task</th><th>Assignee</th><th>Due</th><th>Section</th></tr></thead><tbody id="overdueTableBody"></tbody></table></div>
+    <div class="card"><h2><span class="dot" style="background:#fc8181"></span>Overdue Tasks</h2><div style="max-height:320px;overflow-y:auto"><table class="overdue-table" style="width:100%"><thead><tr><th style="position:sticky;top:0;background:var(--bg-card);z-index:1">Task</th><th style="position:sticky;top:0;background:var(--bg-card);z-index:1">Assignee</th><th style="position:sticky;top:0;background:var(--bg-card);z-index:1">Due</th><th style="position:sticky;top:0;background:var(--bg-card);z-index:1">Section</th></tr></thead><tbody id="overdueTableBody"></tbody></table></div></div>
   </div>
 
   <!-- Oldest open tasks -->
@@ -730,9 +730,8 @@ const HTML_SHELL = `<!DOCTYPE html>
   </div>
 
   <!-- Assignee distribution -->
-  <div class="charts-row row-2" style="margin-bottom:20px">
-    <div class="card"><h2><span class="dot" style="background:#4299e1"></span>Assignee Distribution</h2><div id="assigneeList"></div></div>
-    <div class="card"><h2><span class="dot" style="background:#63b3ed"></span>Assignee Chart</h2><div style="position:relative;height:280px"><canvas id="assigneeChartFull"></canvas></div></div>
+  <div class="charts-row row-1" style="margin-bottom:20px">
+    <div class="card"><h2><span class="dot" style="background:#4299e1"></span>Assignee Workload</h2><div id="assigneeList"></div></div>
   </div>
 
   </div><!-- /dashContent -->
@@ -782,7 +781,7 @@ setBar(5);
 // Fetches /api/data (cached 5 min at edge) and drives a calibrated progress bar.
 // Each Asana page takes ~1s; ~23 pages total → ~23s cold, instant when cached.
 // localStorage cache key — bump version when data structure changes
-const LS_KEY     = 'dts-dash-v21';
+const LS_KEY     = 'dts-dash-v22';
 const LS_TTL_MS  = 5 * 60 * 1000; // 5 min
 
 function lsGet() {
@@ -828,7 +827,7 @@ function init() {
     setBar(100);
     try { populate(cached.data); } catch(e) { /* fall through to fresh fetch */ }
     const label = isFresh ? '⚡ cached' : '⚡ stale — refreshing';
-    document.querySelector('h1 span').textContent = 'v21 · ' + label;
+    document.querySelector('h1 span').textContent = 'v22 · ' + label;
 
     if (isFresh) return; // done — cache is fresh, no need to refetch
 
@@ -838,7 +837,7 @@ function init() {
       .then(data => {
         if (!data) return;
         lsPut(data);
-        document.querySelector('h1 span').textContent = 'v21 · refreshed';
+        document.querySelector('h1 span').textContent = 'v22 · refreshed';
       })
       .catch(() => {});
     return;
@@ -860,7 +859,7 @@ function init() {
       if (loadDiv) loadDiv.innerHTML = '<div class="load-title"><span class="spinner"></span>Rendering…</div>';
       try {
         populate(data);
-        document.querySelector('h1 span').textContent = 'v21 · loaded in ' + secs + 's';
+        document.querySelector('h1 span').textContent = 'v22 · loaded in ' + secs + 's';
       } catch(renderErr) {
         const ld = document.getElementById('loadingMsg');
         if (ld) ld.innerHTML = '<div class="load-title" style="color:#fc8181">⚠ Render error</div>'
@@ -1141,13 +1140,6 @@ function initCharts(data) {
     options:{ plugins:{legend:{display:false}}, scales:{x:{grid:{display:false},ticks:{color:'#a0aec0'}},y:{grid:{color:'#2d3748'},ticks:{color:'#718096'},beginAtZero:true}}, responsive:true, maintainAspectRatio:false }
   });
 
-  // Full assignee chart
-  const fullA = data.assignees.slice(0,20);
-  new Chart(document.getElementById('assigneeChartFull'), {
-    type:'bar',
-    data:{ labels:fullA.map(a=>a.name.includes('@')?a.name.split('.')[0]:a.name.split(' ')[0]), datasets:[{label:'Open',data:fullA.map(a=>a.total-a.overdue),backgroundColor:'#4299e1',borderRadius:3,stack:'s'},{label:'Overdue',data:fullA.map(a=>a.overdue),backgroundColor:'#fc8181',borderRadius:3,stack:'s'}] },
-    options:{ plugins:{legend:{position:'top',labels:{color:'#a0aec0',usePointStyle:true}}}, scales:{x:{grid:{display:false},ticks:{color:'#718096',maxRotation:60}},y:{grid:{color:'#2d3748'},ticks:{color:'#718096'},beginAtZero:true}}, responsive:true, maintainAspectRatio:false }
-  });
 }
 
 // ── Modal ─────────────────────────────────────────────────────────────────────
