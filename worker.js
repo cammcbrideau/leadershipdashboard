@@ -8,9 +8,15 @@
  * Secrets:  wrangler secret put ASANA_TOKEN
  */
 
-const PROJECT_GID = '1111174651444074';
-const ASANA_API   = 'https://app.asana.com/api/1.0';
-const CACHE_TTL   = 300; // seconds
+const PROJECT_GID  = '1111174651444074';
+const ASANA_API    = 'https://app.asana.com/api/1.0';
+const CACHE_TTL_MS = 5 * 60 * 1000; // 5 minutes in ms
+
+// ─── In-memory cache (persists across requests in the same Worker isolate) ────
+// caches.default does NOT work on workers.dev — this module-level variable does.
+let memCache     = null;   // stringified JSON
+let memCacheTime = 0;      // epoch ms when cache was last written
+let memCacheFetching = false; // prevent stampede on concurrent cold requests
 
 export default {
   async fetch(request, env, ctx) {
@@ -42,24 +48,61 @@ function handleDashboard(_request, env) {
 async function handleApiData(request, env, ctx) {
   if (!env.ASANA_TOKEN) return jsonErr('ASANA_TOKEN secret is not configured.', 500);
 
-  const cache    = caches.default;
-  const cacheKey = new Request(new URL('/api-data-v1', request.url).toString());
-  const cached   = await cache.match(cacheKey);
-  if (cached) return cached;
+  const now    = Date.now();
+  const fresh  = memCache && (now - memCacheTime) < CACHE_TTL_MS;
 
-  try {
-    const data = await fetchAndProcess(env.ASANA_TOKEN);
-    const resp = new Response(JSON.stringify(data), {
+  if (fresh) {
+    // Serve from in-memory cache instantly
+    return new Response(memCache, {
       headers: {
         'Content-Type': 'application/json;charset=UTF-8',
-        'Cache-Control': `public, max-age=${CACHE_TTL}`,
+        'Cache-Control': 'no-store',
         'Access-Control-Allow-Origin': '*',
+        'X-Cache': 'HIT',
+        'X-Cache-Age': String(Math.round((now - memCacheTime) / 1000)) + 's',
       },
     });
-    ctx.waitUntil(cache.put(cacheKey, resp.clone()));
-    return resp;
+  }
+
+  // Cache miss or expired — fetch from Asana
+  // If another request is already fetching, wait briefly then serve stale if available
+  if (memCacheFetching && memCache) {
+    return new Response(memCache, {
+      headers: {
+        'Content-Type': 'application/json;charset=UTF-8',
+        'Access-Control-Allow-Origin': '*',
+        'X-Cache': 'STALE',
+      },
+    });
+  }
+
+  memCacheFetching = true;
+  try {
+    const data = await fetchAndProcess(env.ASANA_TOKEN);
+    memCache      = JSON.stringify(data);
+    memCacheTime  = Date.now();
+    return new Response(memCache, {
+      headers: {
+        'Content-Type': 'application/json;charset=UTF-8',
+        'Cache-Control': 'no-store',
+        'Access-Control-Allow-Origin': '*',
+        'X-Cache': 'MISS',
+      },
+    });
   } catch (err) {
+    // On error, serve stale cache if we have it rather than failing
+    if (memCache) {
+      return new Response(memCache, {
+        headers: {
+          'Content-Type': 'application/json;charset=UTF-8',
+          'Access-Control-Allow-Origin': '*',
+          'X-Cache': 'STALE-ERROR',
+        },
+      });
+    }
     return jsonErr(String(err), 502);
+  } finally {
+    memCacheFetching = false;
   }
 }
 
@@ -427,7 +470,7 @@ const HTML_SHELL = `<!DOCTYPE html>
 
 <div class="header">
   <div>
-    <h1>DTS Leadership Dashboard <span style="font-size:11px;font-weight:400;color:#4a5568;margin-left:8px">v12 · not cached</span></h1>
+    <h1>DTS Leadership Dashboard <span style="font-size:11px;font-weight:400;color:#4a5568;margin-left:8px">v13 · loading…</span></h1>
     <div class="sub">Western Health Digital &amp; Technology Services</div>
   </div>
   <div style="display:flex;align-items:center;gap:10px;flex-wrap:wrap">
@@ -612,8 +655,8 @@ function init() {
   fetch('/api/data')
     .then(r => {
       if (!r.ok) throw new Error('HTTP ' + r.status + ' from /api/data');
-      const cf = r.headers.get('cf-cache-status') || r.headers.get('x-cache') || 'live';
-      document.querySelector('h1 span').textContent = 'v12 · ' + cf.toLowerCase();
+      const cf = r.headers.get('x-cache') || r.headers.get('cf-cache-status') || 'live';
+      document.querySelector('h1 span').textContent = 'v13 · ' + cf.toLowerCase();
       return r.json();
     })
     .then(data => {
