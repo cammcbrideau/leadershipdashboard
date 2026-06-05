@@ -419,7 +419,7 @@ const HTML_SHELL = `<!DOCTYPE html>
 
 <div class="header">
   <div>
-    <h1>DTS Leadership Dashboard</h1>
+    <h1>DTS Leadership Dashboard <span style="font-size:11px;font-weight:400;color:#4a5568;margin-left:8px">v12 · not cached</span></h1>
     <div class="sub">Western Health Digital &amp; Technology Services</div>
   </div>
   <div style="display:flex;align-items:center;gap:10px;flex-wrap:wrap">
@@ -592,7 +592,12 @@ function init() {
   startTicker();
 
   fetch('/api/data')
-    .then(r => { if (!r.ok) throw new Error('HTTP ' + r.status + ' from /api/data'); return r.json(); })
+    .then(r => {
+      if (!r.ok) throw new Error('HTTP ' + r.status + ' from /api/data');
+      const cf = r.headers.get('cf-cache-status') || r.headers.get('x-cache') || 'live';
+      document.querySelector('h1 span').textContent = 'v12 · ' + cf.toLowerCase();
+      return r.json();
+    })
     .then(data => {
       clearInterval(ticker);
       setBar(100);
