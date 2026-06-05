@@ -470,7 +470,7 @@ const HTML_SHELL = `<!DOCTYPE html>
 
 <div class="header">
   <div>
-    <h1>DTS Leadership Dashboard <span style="font-size:11px;font-weight:400;color:#4a5568;margin-left:8px">v13 · loading…</span></h1>
+    <h1>DTS Leadership Dashboard <span style="font-size:11px;font-weight:400;color:#4a5568;margin-left:8px">v14 · loading…</span></h1>
     <div class="sub">Western Health Digital &amp; Technology Services</div>
   </div>
   <div style="display:flex;align-items:center;gap:10px;flex-wrap:wrap">
@@ -478,7 +478,7 @@ const HTML_SHELL = `<!DOCTYPE html>
     <button class="theme-toggle" onclick="toggleTheme()" id="themeBtn">☀️ Light Mode</button>
     <span class="badge">LIVE</span>
     <span class="last-updated" id="lastUpdated">Loading…</span>
-    <button class="theme-toggle" onclick="location.reload(true)" style="font-size:12px;padding:4px 10px" title="Refresh data from Asana">↻ Refresh</button>
+    <button class="theme-toggle" onclick="try{localStorage.removeItem('dts-dash-v14')}catch(e){}location.reload()" style="font-size:12px;padding:4px 10px" title="Force-refresh from Asana (clears cache)">↻ Refresh</button>
   </div>
 </div>
 
@@ -625,6 +625,22 @@ setBar(5);
 // ── Bootstrap ─────────────────────────────────────────────────────────────────
 // Fetches /api/data (cached 5 min at edge) and drives a calibrated progress bar.
 // Each Asana page takes ~1s; ~23 pages total → ~23s cold, instant when cached.
+// localStorage cache key — bump version when data structure changes
+const LS_KEY     = 'dts-dash-v14';
+const LS_TTL_MS  = 5 * 60 * 1000; // 5 min
+
+function lsGet() {
+  try {
+    const raw = localStorage.getItem(LS_KEY);
+    if (!raw) return null;
+    const obj = JSON.parse(raw);
+    return obj; // { data, ts }
+  } catch(e) { return null; }
+}
+function lsPut(data) {
+  try { localStorage.setItem(LS_KEY, JSON.stringify({ data, ts: Date.now() })); } catch(e) {}
+}
+
 function init() {
   const secsEl = document.getElementById('loadSecs');
   const fillEl = document.getElementById('loadBarFill');
@@ -634,13 +650,10 @@ function init() {
   function startTicker() {
     ticker = setInterval(() => {
       secs++;
-      // Update big second counter
       if (secsEl) secsEl.textContent = secs;
-      // Progress bar asymptotes to 94%
       const pct = Math.round(94 - 89 * Math.exp(-secs / 18));
       setBar(pct);
       if (fillEl) fillEl.style.width = pct + '%';
-      // After 35s show a warning
       if (secs === 35) {
         const msg = document.getElementById('loadingMsg');
         if (msg) msg.insertAdjacentHTML('beforeend',
@@ -650,22 +663,48 @@ function init() {
     }, 1000);
   }
 
+  // ── Check localStorage first ──────────────────────────────────────────────
+  const cached = lsGet();
+  if (cached) {
+    const age    = Date.now() - cached.ts;
+    const isFresh = age < LS_TTL_MS;
+    // Render immediately from cache
+    setBar(100);
+    try { populate(cached.data); } catch(e) { /* fall through to fresh fetch */ }
+    const label = isFresh ? '⚡ cached' : '⚡ stale — refreshing';
+    document.querySelector('h1 span').textContent = 'v14 · ' + label;
+
+    if (isFresh) return; // done — cache is fresh, no need to refetch
+
+    // Stale: refresh quietly in the background
+    fetch('/api/data')
+      .then(r => r.ok ? r.json() : null)
+      .then(data => {
+        if (!data) return;
+        lsPut(data);
+        document.querySelector('h1 span').textContent = 'v14 · refreshed';
+      })
+      .catch(() => {});
+    return;
+  }
+
+  // ── No cache — full fetch with progress indicator ─────────────────────────
   startTicker();
 
   fetch('/api/data')
     .then(r => {
       if (!r.ok) throw new Error('HTTP ' + r.status + ' from /api/data');
-      const cf = r.headers.get('x-cache') || r.headers.get('cf-cache-status') || 'live';
-      document.querySelector('h1 span').textContent = 'v13 · ' + cf.toLowerCase();
       return r.json();
     })
     .then(data => {
       clearInterval(ticker);
       setBar(100);
+      lsPut(data); // save to localStorage so next load is instant
       const loadDiv = document.getElementById('loadingMsg');
       if (loadDiv) loadDiv.innerHTML = '<div class="load-title"><span class="spinner"></span>Rendering…</div>';
       try {
         populate(data);
+        document.querySelector('h1 span').textContent = 'v14 · loaded in ' + secs + 's';
       } catch(renderErr) {
         const ld = document.getElementById('loadingMsg');
         if (ld) ld.innerHTML = '<div class="load-title" style="color:#fc8181">⚠ Render error</div>'
