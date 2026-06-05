@@ -412,6 +412,9 @@ const HTML_SHELL = `<!DOCTYPE html>
   .overdue-table tr:hover td{background:var(--hover-row)}
   .task-link-wrap{color:var(--text);text-decoration:none}
   .task-link-wrap:hover{color:#63b3ed;text-decoration:underline}
+  .rc-card{transition:background .15s}
+  .rc-card:hover{background:var(--hover-row)!important}
+  .rc-card:hover .rc-link{color:#63b3ed!important}
   .pill{font-size:11px;padding:2px 8px;border-radius:99px;font-weight:600;white-space:nowrap}
   .pill-green{background:var(--pill-green-bg);color:var(--pill-green-fg)}
   .pill-yellow{background:var(--pill-yellow-bg);color:var(--pill-yellow-fg)}
@@ -469,7 +472,7 @@ const HTML_SHELL = `<!DOCTYPE html>
 
 <div class="header">
   <div>
-    <h1>DTS Leadership Dashboard <span style="font-size:11px;font-weight:400;color:#4a5568;margin-left:8px">v15 · loading…</span></h1>
+    <h1>DTS Leadership Dashboard <span style="font-size:11px;font-weight:400;color:#4a5568;margin-left:8px">v16 · loading…</span></h1>
     <div class="sub">Western Health Digital &amp; Technology Services</div>
   </div>
   <div style="display:flex;align-items:center;gap:10px;flex-wrap:wrap">
@@ -477,7 +480,7 @@ const HTML_SHELL = `<!DOCTYPE html>
     <button class="theme-toggle" onclick="toggleTheme()" id="themeBtn">☀️ Light Mode</button>
     <span class="badge">LIVE</span>
     <span class="last-updated" id="lastUpdated">Loading…</span>
-    <button class="theme-toggle" onclick="try{localStorage.removeItem('dts-dash-v15')}catch(e){}location.reload()" style="font-size:12px;padding:4px 10px" title="Force-refresh from Asana (clears cache)">↻ Refresh</button>
+    <button class="theme-toggle" onclick="try{localStorage.removeItem('dts-dash-v16')}catch(e){}location.reload()" style="font-size:12px;padding:4px 10px" title="Force-refresh from Asana (clears cache)">↻ Refresh</button>
   </div>
 </div>
 
@@ -640,7 +643,7 @@ setBar(5);
 // Fetches /api/data (cached 5 min at edge) and drives a calibrated progress bar.
 // Each Asana page takes ~1s; ~23 pages total → ~23s cold, instant when cached.
 // localStorage cache key — bump version when data structure changes
-const LS_KEY     = 'dts-dash-v15';
+const LS_KEY     = 'dts-dash-v16';
 const LS_TTL_MS  = 5 * 60 * 1000; // 5 min
 
 function lsGet() {
@@ -686,7 +689,7 @@ function init() {
     setBar(100);
     try { populate(cached.data); } catch(e) { /* fall through to fresh fetch */ }
     const label = isFresh ? '⚡ cached' : '⚡ stale — refreshing';
-    document.querySelector('h1 span').textContent = 'v15 · ' + label;
+    document.querySelector('h1 span').textContent = 'v16 · ' + label;
 
     if (isFresh) return; // done — cache is fresh, no need to refetch
 
@@ -696,7 +699,7 @@ function init() {
       .then(data => {
         if (!data) return;
         lsPut(data);
-        document.querySelector('h1 span').textContent = 'v15 · refreshed';
+        document.querySelector('h1 span').textContent = 'v16 · refreshed';
       })
       .catch(() => {});
     return;
@@ -718,7 +721,7 @@ function init() {
       if (loadDiv) loadDiv.innerHTML = '<div class="load-title"><span class="spinner"></span>Rendering…</div>';
       try {
         populate(data);
-        document.querySelector('h1 span').textContent = 'v15 · loaded in ' + secs + 's';
+        document.querySelector('h1 span').textContent = 'v16 · loaded in ' + secs + 's';
       } catch(renderErr) {
         const ld = document.getElementById('loadingMsg');
         if (ld) ld.innerHTML = '<div class="load-title" style="color:#fc8181">⚠ Render error</div>'
@@ -863,7 +866,7 @@ function renderRecentCompleted(list) {
     const c=color(t.assignee), ini=initials(t.assignee), nm=short(t.assignee);
     const safe=t.name.replace(/&/g,'&amp;').replace(/</g,'&lt;');
     const sec=t.section?'<span style="font-size:10px;color:var(--text-faintest);margin-left:6px;background:var(--bar-track);padding:1px 6px;border-radius:10px">'+t.section+'</span>':'';
-    return '<div style="display:flex;align-items:center;gap:10px;padding:8px 10px;border-radius:8px;background:var(--bg-card);border:1px solid var(--border)" onmouseover="this.style.background=\'var(--hover-row)\'" onmouseout="this.style.background=\'var(--bg-card)\'"><div style="width:20px;text-align:right;font-size:11px;font-weight:600;color:var(--text-faintest);flex-shrink:0">'+(i+1)+'</div><div style="width:34px;height:34px;border-radius:50%;background:'+c+';display:flex;align-items:center;justify-content:center;font-size:12px;font-weight:700;color:#fff;flex-shrink:0">'+ini+'</div><div style="min-width:0;flex:1"><a href="'+ASANA_BASE+'/'+t.gid+'/f" target="_blank" rel="noopener" style="color:var(--text);text-decoration:none;font-size:13px;font-weight:500;display:block;white-space:nowrap;overflow:hidden;text-overflow:ellipsis" onmouseover="this.style.color=\'#63b3ed\'" onmouseout="this.style.color=\'var(--text)\'"><span style="color:#48bb78;margin-right:5px">✓</span>'+safe+'</a><div style="font-size:11px;color:var(--text-muted);margin-top:2px;display:flex;align-items:center;gap:6px"><span>'+nm+'</span>'+(t.completedAt?'<span style="color:var(--text-faintest)">· Completed '+t.completedAt+'</span>':'')+sec+'</div></div></div>';
+    return '<div class="rc-card" style="display:flex;align-items:center;gap:10px;padding:8px 10px;border-radius:8px;background:var(--bg-card);border:1px solid var(--border)"><div style="width:20px;text-align:right;font-size:11px;font-weight:600;color:var(--text-faintest);flex-shrink:0">'+(i+1)+'</div><div style="width:34px;height:34px;border-radius:50%;background:'+c+';display:flex;align-items:center;justify-content:center;font-size:12px;font-weight:700;color:#fff;flex-shrink:0">'+ini+'</div><div style="min-width:0;flex:1"><a class="rc-link" href="'+ASANA_BASE+'/'+t.gid+'/f" target="_blank" rel="noopener" style="color:var(--text);text-decoration:none;font-size:13px;font-weight:500;display:block;white-space:nowrap;overflow:hidden;text-overflow:ellipsis"><span style="color:#48bb78;margin-right:5px">✓</span>'+safe+'</a><div style="font-size:11px;color:var(--text-muted);margin-top:2px;display:flex;align-items:center;gap:6px"><span>'+nm+'</span>'+(t.completedAt?'<span style="color:var(--text-faintest)">· Completed '+t.completedAt+'</span>':'')+sec+'</div></div></div>';
   }).join('');
 }
 
