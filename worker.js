@@ -222,25 +222,24 @@ async function fetchAndProcess(token) {
   const sections = (await secResp.json()).data
     .filter(s => !EXCLUDED_SECTION_NAMES.has(s.name));
 
-  // 2. Parallel: open tasks per section + completed dates per section + recent completed widget
-  const [openResults, doneResults, recentCompleted] = await Promise.all([
+  // 2. Parallel: open tasks per section + completed task dates (project-level) + recent completed
+  const [openResults, doneDates, recentCompleted] = await Promise.all([
     Promise.all(sections.map(s => fetchSectionTasks(token, s.gid, s.name, false))),
-    Promise.all(sections.map(s => fetchSectionTasks(token, s.gid, s.name, true))),
+    fetchAllCompletedDates(token),   // minimal fields, sequential pages, runs in parallel
     fetchRecentCompleted(token),
   ]);
 
-  return processData(openResults.flat(), doneResults.flat(), recentCompleted);
+  return processData(openResults.flat(), doneDates, recentCompleted);
 }
 
-async function fetchSectionTasks(token, sectionGid, sectionName, completed) {
-  const fields = completed ? DONE_DATE_FIELDS : OPEN_FIELDS;
+async function fetchSectionTasks(token, sectionGid, sectionName) {
   const tasks  = [];
   let   offset = null;
   do {
     const params = new URLSearchParams({
       section:    sectionGid,
-      opt_fields: fields,
-      completed:  String(completed),
+      opt_fields: OPEN_FIELDS,
+      completed:  'false',
       limit:      '100',
     });
     if (offset) params.set('offset', offset);
@@ -249,11 +248,30 @@ async function fetchSectionTasks(token, sectionGid, sectionName, completed) {
     });
     if (!resp.ok) return tasks;
     const json = await resp.json();
-    if (!completed) {
-      json.data.forEach(t => {
-        if (!t.memberships?.length) t._sectionName = sectionName;
-      });
-    }
+    json.data.forEach(t => { if (!t.memberships?.length) t._sectionName = sectionName; });
+    tasks.push(...json.data);
+    offset = json.next_page?.offset ?? null;
+  } while (offset);
+  return tasks;
+}
+
+// Fetch all completed task dates from the project — minimal fields, runs in parallel with open fetches
+async function fetchAllCompletedDates(token) {
+  const tasks  = [];
+  let   offset = null;
+  do {
+    const params = new URLSearchParams({
+      project:    PROJECT_GID,
+      opt_fields: DONE_DATE_FIELDS,
+      completed:  'true',
+      limit:      '100',
+    });
+    if (offset) params.set('offset', offset);
+    const resp = await fetch(`${ASANA_API}/tasks?${params}`, {
+      headers: { Authorization: `Bearer ${token}` },
+    });
+    if (!resp.ok) return tasks;
+    const json = await resp.json();
     tasks.push(...json.data);
     offset = json.next_page?.offset ?? null;
   } while (offset);
@@ -588,7 +606,7 @@ const HTML_SHELL = `<!DOCTYPE html>
 
 <div class="header">
   <div>
-    <h1>DTS Leadership Dashboard <span style="font-size:11px;font-weight:400;color:#4a5568;margin-left:8px">v18 · loading…</span></h1>
+    <h1>DTS Leadership Dashboard <span style="font-size:11px;font-weight:400;color:#4a5568;margin-left:8px">v19 · loading…</span></h1>
     <div class="sub">Western Health Digital &amp; Technology Services</div>
   </div>
   <div style="display:flex;align-items:center;gap:10px;flex-wrap:wrap">
@@ -596,7 +614,7 @@ const HTML_SHELL = `<!DOCTYPE html>
     <button class="theme-toggle" onclick="toggleTheme()" id="themeBtn">☀️ Light Mode</button>
     <span class="badge">LIVE</span>
     <span class="last-updated" id="lastUpdated">Loading…</span>
-    <button class="theme-toggle" onclick="try{localStorage.removeItem('dts-dash-v18')}catch(e){}location.reload()" style="font-size:12px;padding:4px 10px" title="Force-refresh from Asana (clears cache)">↻ Refresh</button>
+    <button class="theme-toggle" onclick="try{localStorage.removeItem('dts-dash-v19')}catch(e){}location.reload()" style="font-size:12px;padding:4px 10px" title="Force-refresh from Asana (clears cache)">↻ Refresh</button>
   </div>
 </div>
 
@@ -765,7 +783,7 @@ setBar(5);
 // Fetches /api/data (cached 5 min at edge) and drives a calibrated progress bar.
 // Each Asana page takes ~1s; ~23 pages total → ~23s cold, instant when cached.
 // localStorage cache key — bump version when data structure changes
-const LS_KEY     = 'dts-dash-v18';
+const LS_KEY     = 'dts-dash-v19';
 const LS_TTL_MS  = 5 * 60 * 1000; // 5 min
 
 function lsGet() {
@@ -811,7 +829,7 @@ function init() {
     setBar(100);
     try { populate(cached.data); } catch(e) { /* fall through to fresh fetch */ }
     const label = isFresh ? '⚡ cached' : '⚡ stale — refreshing';
-    document.querySelector('h1 span').textContent = 'v18 · ' + label;
+    document.querySelector('h1 span').textContent = 'v19 · ' + label;
 
     if (isFresh) return; // done — cache is fresh, no need to refetch
 
@@ -821,7 +839,7 @@ function init() {
       .then(data => {
         if (!data) return;
         lsPut(data);
-        document.querySelector('h1 span').textContent = 'v18 · refreshed';
+        document.querySelector('h1 span').textContent = 'v19 · refreshed';
       })
       .catch(() => {});
     return;
@@ -843,7 +861,7 @@ function init() {
       if (loadDiv) loadDiv.innerHTML = '<div class="load-title"><span class="spinner"></span>Rendering…</div>';
       try {
         populate(data);
-        document.querySelector('h1 span').textContent = 'v18 · loaded in ' + secs + 's';
+        document.querySelector('h1 span').textContent = 'v19 · loaded in ' + secs + 's';
       } catch(renderErr) {
         const ld = document.getElementById('loadingMsg');
         if (ld) ld.innerHTML = '<div class="load-title" style="color:#fc8181">⚠ Render error</div>'
